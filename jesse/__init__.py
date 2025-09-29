@@ -244,6 +244,49 @@ def run() -> None:
     uvicorn.run(fastapi_app, host=host, port=port, log_level="info")
 
 
+@cli.command()
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "sse", "streamable-http", "http"]),
+    default="stdio",
+    show_default=True,
+    help="Transport protocol to expose for the FastMCP server.",
+)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Host address for HTTP or SSE transports.",
+)
+@click.option(
+    "--port",
+    default=8765,
+    show_default=True,
+    help="Port for HTTP or SSE transports.",
+)
+@click.option(
+    "--hide-banner",
+    is_flag=True,
+    default=False,
+    help="Hide the FastMCP startup banner output.",
+)
+def fastmcp(transport: str, host: str, port: int, hide_banner: bool) -> None:
+    """Run the FastMCP server that exposes Jesse management tools."""
+
+    from jesse.services.mcp import run_fastmcp_server
+
+    transport_kwargs = {}
+    if transport in {"http", "sse", "streamable-http"}:
+        transport_kwargs["host"] = host
+        transport_kwargs["port"] = port
+
+    run_fastmcp_server(
+        transport=transport,
+        show_banner=not hide_banner,
+        **transport_kwargs,
+    )
+
+
 @fastapi_app.on_event("shutdown")
 def shutdown_event():
     from jesse.services.db import database
