@@ -93,6 +93,7 @@ class exchanges:
     GATE_SPOT = 'Gate Spot'
     HYPERLIQUID_PERPETUAL = 'Hyperliquid Perpetual'
     HYPERLIQUID_PERPETUAL_TESTNET = 'Hyperliquid Perpetual Testnet'
+    KUCOIN_SPOT = 'KuCoin Spot'
 
 
 @dataclass
