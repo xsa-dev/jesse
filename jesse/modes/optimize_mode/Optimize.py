@@ -16,8 +16,6 @@ from jesse.services.progressbar import Progressbar
 from jesse.services.redis import is_process_active
 from jesse.models.OptimizationSession import update_optimization_session_status, update_optimization_session_trials, get_optimization_session, get_optimization_session_by_id
 import traceback
-from dotenv import load_dotenv
-
 
 # Define a Ray-compatible remote function
 
@@ -92,8 +90,6 @@ class Optimizer:
             optimal_total: int,
             cpu_cores: int,
     ) -> None:
-
-        load_dotenv()
         # Check for Python 3.13 first thing
         if jh.python_version() == (3, 13):
             raise ValueError(
@@ -160,11 +156,7 @@ class Optimizer:
         # Initialize Ray if not already
         if not ray.is_initialized():
             try:
-                # Get PostgreSQL file exclusions to prevent Ray from uploading large database files
-                ray.init(
-                    num_cpus=self.cpu_cores, 
-                    ignore_reinit_error=True,
-                )
+                ray.init(num_cpus=self.cpu_cores, ignore_reinit_error=True)
                 logger.log_optimize_mode(f"Successfully started optimization session with {self.cpu_cores} CPU cores")
             except Exception as e:
                 logger.log_optimize_mode(f"Error initializing Ray: {e}. Falling back to 1 CPU.")
