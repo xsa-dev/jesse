@@ -4,6 +4,11 @@ import base64
 from datetime import timedelta
 from multiprocessing import cpu_count
 import optuna
+from optuna.samplers import TPESampler, RandomSampler
+try:
+    from optuna.samplers import CMAESampler
+except Exception:  # pragma: no cover
+    CMAESampler = None
 import ray
 import numpy as np
 import jesse.helpers as jh
@@ -108,7 +113,7 @@ class Optimizer:
 
         # Create study storage for persistence
         os.makedirs('./storage/temp/optuna', exist_ok=True)
-        self.storage_url = f"sqlite:///./storage/temp/optuna/optuna_study.db"
+        self.storage_url = "sqlite:///./storage/temp/optuna/optuna_study.db"
         # The study_name uniquely identifies the optimization session - changing it will create a new session
         self.study_name = f"{router.routes[0].strategy_name}_optuna_ray_{self.session_id}"
 
@@ -141,12 +146,57 @@ class Optimizer:
         self.trial_counter = 0
         self.completed_trials = 0
 
+        # Build Optuna distributions from strategy hyperparameters once
+        self.distributions = {}
+        for param in self.strategy_hp:
+            param_name = str(param['name'])
+            param_type = param['type']
+            if isinstance(param_type, type):
+                param_type = param_type.__name__
+            else:
+                param_type = param_type.strip("'").strip('"')
+
+            if param_type == 'int':
+                if 'step' in param and param['step'] is not None:
+                    self.distributions[param_name] = optuna.distributions.IntDistribution(
+                        low=param['min'], high=param['max'], step=param['step']
+                    )
+                else:
+                    self.distributions[param_name] = optuna.distributions.IntDistribution(
+                        low=param['min'], high=param['max']
+                    )
+            elif param_type == 'float':
+                if 'step' in param and param['step'] is not None:
+                    self.distributions[param_name] = optuna.distributions.FloatDistribution(
+                        low=param['min'], high=param['max'], step=param['step']
+                    )
+                else:
+                    self.distributions[param_name] = optuna.distributions.FloatDistribution(
+                        low=param['min'], high=param['max']
+                    )
+            elif param_type == 'categorical':
+                self.distributions[param_name] = optuna.distributions.CategoricalDistribution(param['options'])
+            else:
+                raise ValueError(f"Unsupported hyperparameter type: {param_type}")
+
+        # Configure Optuna sampler from config (default: TPE)
+        sampler_name = str(jh.get_config('env.optimization.sampler', 'tpe')).lower()
+        if sampler_name in ('tpe', 'tpesampler'):
+            sampler = TPESampler()
+        elif sampler_name in ('random', 'randomsampler'):
+            sampler = RandomSampler()
+        elif sampler_name in ('cmaes', 'cma-es', 'cmaessampler') and CMAESampler is not None:
+            sampler = CMAESampler()
+        else:
+            sampler = TPESampler()
+
         # Create or load the Optuna study for persistence
         self.study = optuna.create_study(
             direction='maximize',
             storage=self.storage_url,
             study_name=self.study_name,
-            load_if_exists=True
+            load_if_exists=True,
+            sampler=sampler
         )
 
         # Buffer to accumulate objective curve data points (one point per trial)
@@ -264,62 +314,11 @@ class Optimizer:
         return hp
 
     def _create_optuna_trial(self, trial_number, params, score, training_metrics, testing_metrics):
-        """Create and store an Optuna trial for persistence"""
+        """Kept for backward compatibility (no-op when using ask/tell)."""
         try:
-            # Create distributions for the parameters
-            distributions = {}
-            for param in self.strategy_hp:
-                param_name = str(param['name'])
-                param_type = param['type']
-                if isinstance(param_type, type):
-                    param_type = param_type.__name__
-                else:
-                    param_type = param_type.strip("'").strip('"')
-
-                if param_type == 'int':
-                    if 'step' in param and param['step'] is not None:
-                        distributions[param_name] = optuna.distributions.IntDistribution(
-                            low=param['min'],
-                            high=param['max'],
-                            step=param['step']
-                        )
-                    else:
-                        distributions[param_name] = optuna.distributions.IntDistribution(
-                            low=param['min'],
-                            high=param['max']
-                        )
-                elif param_type == 'float':
-                    if 'step' in param and param['step'] is not None:
-                        distributions[param_name] = optuna.distributions.FloatDistribution(
-                            low=param['min'],
-                            high=param['max'],
-                            step=param['step']
-                        )
-                    else:
-                        distributions[param_name] = optuna.distributions.FloatDistribution(
-                            low=param['min'],
-                            high=param['max']
-                        )
-                elif param_type == 'categorical':
-                    distributions[param_name] = optuna.distributions.CategoricalDistribution(param['options'])
-
-            # Create a new trial
-            trial = optuna.create_trial(
-                params=params,
-                distributions=distributions,
-                value=score,
-                user_attrs={
-                    'training_metrics': training_metrics,
-                    'testing_metrics': testing_metrics
-                }
-            )
-
-            # Add the trial to the study
-            self.study.add_trial(trial)
+            # With ask/tell, Optuna already persists trials; we only return True.
             return True
-
-        except Exception as e:
-            logger.log_optimize_mode(f"Error creating Optuna trial: {e}")
+        except Exception:
             return False
 
     def _process_trial_result(self, result):
@@ -334,8 +333,14 @@ class Optimizer:
         self.completed_trials += 1
         self.progressbar.update()
 
-        # Store trial in Optuna for persistence
-        self._create_optuna_trial(trial_number, params, score, training_metrics, testing_metrics)
+        # Report result to Optuna via ask/tell API if available
+        try:
+            trial = self._active_trials_by_number.get(trial_number)
+            if trial is not None:
+                # Tell Optuna the objective value
+                self.study.tell(trial, score)
+        except Exception as e:
+            logger.log_optimize_mode(f"Optuna tell failed for trial {trial_number}: {e}")
 
         # Update the dashboard with general information about the progress
         general_info = {
@@ -507,11 +512,9 @@ class Optimizer:
         # Track the best trial - handle empty study gracefully
         try:
             best_trial_value = self.study.best_value if self.study.trials else 0.0
-            best_trial_params = self.study.best_params if self.study.trials else None
         except (ValueError, AttributeError) as e:
             logger.log_optimize_mode(f"Could not access best trial: {e}. Using default values.")
             best_trial_value = 0.0
-            best_trial_params = None
 
         try:
             # Maximum number of active workers (slightly higher than CPU cores to keep CPUs busy)
@@ -519,6 +522,7 @@ class Optimizer:
 
             # Dictionary to keep track of active workers
             active_refs = {}
+            self._active_trials_by_number = {}
             # Begin optimization loop
             while self.completed_trials < self.n_trials:
                 if self.completed_trials == 0:
@@ -531,8 +535,9 @@ class Optimizer:
                     )
                 # Launch new trials if we have capacity
                 while len(active_refs) < max_workers and self.trial_counter < self.n_trials:
-                    # Generate parameters for this trial
-                    hp = self._generate_trial_params()
+                    # Ask Optuna for the next trial
+                    trial = self.study.ask(self.distributions)
+                    hp = trial.params
 
                     # Launch the trial evaluation
                     ref = ray_evaluate_trial.options(num_cpus=1).remote(
@@ -550,8 +555,9 @@ class Optimizer:
                         self.trial_counter
                     )
 
-                    # Store the reference
+                    # Store the reference and keep mapping to Optuna trial
                     active_refs[ref] = self.trial_counter
+                    self._active_trials_by_number[self.trial_counter] = trial
                     self.trial_counter += 1
 
                 # No more workers to launch, wait for results
@@ -572,14 +578,13 @@ class Optimizer:
                         # Update best trial if better
                         if result['score'] > best_trial_value:
                             best_trial_value = result['score']
-                            best_trial_params = result['params']
+                            # Track best value locally for faster comparison
                     except ray.exceptions.RayTaskError as e:
                         # Check if this is a RouteNotFound error converted to RuntimeError
                         if hasattr(e, 'cause') and isinstance(e.cause, RuntimeError) and 'RouteNotFound:' in str(e.cause):
                             raise e.cause
                         else:
                             jh.debug(f'Ray task error for trial {trial_number}: {e}')
-                            original_exception = e.cause
                             raise
                     except Exception as e:
                         jh.debug(f'Exception raised in the ray method for trial {trial_number}: {e}')
