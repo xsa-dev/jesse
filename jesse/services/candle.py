@@ -330,9 +330,9 @@ def _get_candles_from_db(
     ).order_by(Candle.timestamp.asc()).tuples())
 
     # Check if we got any candles
-    if not candles_tuple:
-        raise CandleNotFoundInDatabase(f"No candles found for {symbol} on {exchange} between {jh.timestamp_to_date(start_date_timestamp)} and {jh.timestamp_to_date(finish_date_timestamp)}.")
-    
+    # if not candles_tuple:
+    #     raise CandleNotFoundInDatabase(f"No candles found for {symbol} on {exchange} between {jh.timestamp_to_date(start_date_timestamp)} and {jh.timestamp_to_date(finish_date_timestamp)}.")
+    #
     # Convert to numpy array for easier timestamp extraction
     candles_array = np.array(candles_tuple)
     
@@ -424,11 +424,12 @@ def _get_candles_from_db(
                     candles_array = np.concatenate([candles_array, np.array(empty_candles)])
             else:
                 # Missing candles at the end of the requested range
-                raise CandleNotFoundInDatabase(
-                    f"Missing recent candles for \"{symbol}\" on \"{exchange}\". "
-                    f"Requested data until \"{jh.timestamp_to_time(finish_date_timestamp)[:19]}\", "
-                    f"but latest available candle is up to \"{jh.timestamp_to_time(latest_available)[:19]}\"."
-                )
+                # raise CandleNotFoundInDatabase(
+                #     f"Missing recent candles for \"{symbol}\" on \"{exchange}\". "
+                #     f"Requested data until \"{jh.timestamp_to_time(finish_date_timestamp)[:19]}\", "
+                #     f"but latest available candle is up to \"{jh.timestamp_to_time(latest_available)[:19]}\"."
+                # )
+                candles_array = np.concatenate([candles_array, np.array(empty_candles)])
 
     if caching:
         # cache for 1 week it for near future calls

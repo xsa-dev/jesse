@@ -452,7 +452,7 @@ class BatchCSVLoader:
         return info
     
     def save_symbol_to_database(self, symbol: str, timeframe: str = "1m", 
-                               exchange: str = "CustomCSV", 
+                               exchange: str = "Bybit Spot", 
                                max_candles: int = 0) -> SymbolLoadResult:
         """
         Load and save a single symbol to database.
@@ -550,7 +550,7 @@ class BatchCSVLoader:
         return result
     
     def save_all_symbols_to_database(self, timeframe: str = "1m", 
-                                   exchange: str = "CustomCSV",
+                                   exchange: str = "Bybit Spot",
                                    max_candles: int = 0,
                                    max_workers: int = 1,
                                    batch_size: int = 20,
