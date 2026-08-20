@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import jesse.helpers as jh
 from jesse.modes.utils import get_exchange_type
 from jesse.enums import exchanges
@@ -171,8 +173,10 @@ def set_config(conf: dict) -> None:
 
 
 def reset_config() -> None:
-    global config
-    config = backup_config.copy()
+    # Modules import this dictionary directly, so resetting must preserve its
+    # identity while replacing every nested runtime mutation.
+    config.clear()
+    config.update(deepcopy(backup_config))
 
 
-backup_config = config.copy()
+backup_config = deepcopy(config)
