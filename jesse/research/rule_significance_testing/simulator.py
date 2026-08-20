@@ -26,7 +26,6 @@ from jesse.constants import TIMEFRAME_TO_ONE_MINUTES
 from jesse.modes.backtest_mode import (
     _prepare_routes,
     _prepare_times_before_simulation,
-    _get_fixed_jumped_candle,
 )
 
 # Reuse _format_config from the research backtest module so the config dict
@@ -133,12 +132,6 @@ def run_signal_only_backtest(
         # ---- Feed candles for every route/data-route symbol ----
         for j in trading_candles:
             short_candle = trading_candles[j]['candles'][i].copy()
-
-            # Fix gap-open prices (carry previous close → current open)
-            if i != 0:
-                short_candle = _get_fixed_jumped_candle(
-                    trading_candles[j]['candles'][i - 1], short_candle
-                )
 
             exc = trading_candles[j]['exchange']
             sym = trading_candles[j]['symbol']

@@ -7,7 +7,7 @@ import jesse.helpers as jh
 import jesse.services.metrics as stats
 from jesse import exceptions
 from jesse.config import config
-from jesse.enums import timeframes, order_types
+from jesse.enums import timeframes, order_types, sides
 from jesse.models import Order, Position
 from jesse.modes.utils import save_daily_portfolio_balance
 from jesse.candle_pipelines import BaseCandlesPipeline
@@ -28,7 +28,6 @@ from jesse.services.progressbar import Progressbar
 from jesse.constants import TIMEFRAME_TO_ONE_MINUTES
 from jesse.services import candle_service, order_service, position_service, exchange_service
 from jesse_rust import candle_from_one_minutes as candle_from_one_minutes_rust
-from jesse_rust import fix_jumped_candles as fix_jumped_candles_rust
 
 
 def run(
@@ -594,25 +593,16 @@ def _step_simulator(
     update_active_orders = order_service.update_active_orders
     execute_simulated_market_orders = order_service.execute_simulated_market_orders
 
-    # When a pair has no candles pipeline, the per-minute 1m work is fully
-    # deterministic upfront: the jumped-candle fix only reads closes (which it
-    # never writes), so one Rust pass over the whole series is bit-exact
-    # equivalent to applying it minute by minute; and since the series is
-    # strictly increasing in time, every per-minute add_candle is a plain
-    # append. So we gap-fix once, bulk-copy the candles into the storage
-    # buffer, and per minute just advance the storage index instead of paying
-    # for add_candle + DynamicNumpyArray.append on every single minute.
-    # If ANY guard below fails, arr_1m stays None and that pair takes the
-    # original per-minute path in the loop — the prefill is purely opt-in.
+    # Pipeline-free, ascending float64 candles can be copied into storage once;
+    # each simulation minute then advances the visible storage index.
     prefilled = []
     for candles_arr, candles_pipeline, exchange, symbol in candles_info:
         arr_1m = None
         if (
             # pipelines rewrite candles batch-by-batch — can't precompute
             candles_pipeline is None
-            # storage buffer and the Rust fix kernel are float64
+            # the storage buffer uses float64 rows
             and candles_arr.dtype == np.float64
-            # fix_jumped_candles_rust mutates the array in place
             and candles_arr.flags.writeable
             # the loop below indexes candles_arr[i] for i in range(length)
             and len(candles_arr) == length
@@ -625,14 +615,11 @@ def _step_simulator(
         ):
             storage = store.candles.get_storage(exchange, symbol, '1m')
             base = storage.index + 1
-            # warmup continuity: the series must strictly follow whatever
-            # warmup candles already sit in storage, for the same reason
+            # Prefill is safe only when the series follows any warmup rows.
             if base == 0 or candles_arr[0, 0] > storage.array[base - 1, 0]:
-                fix_jumped_candles_rust(candles_arr)
                 needed = base + length
                 if needed > len(storage.array):
-                    # grow the buffer once upfront (same end state that
-                    # DynamicNumpyArray.append's geometric growth reaches)
+                    # Allocate enough room for the complete simulation range.
                     new_array = np.zeros((needed,) + storage.array.shape[1:], dtype=storage.array.dtype)
                     new_array[:base] = storage.array[:base]
                     storage.array = new_array
@@ -649,8 +636,8 @@ def _step_simulator(
         # add candles
         for candles_arr, candles_pipeline, exchange, symbol, arr_1m in candles_info:
             if arr_1m is not None:
-                # candles were gap-fixed and copied into the storage buffer
-                # upfront; "appending" this minute's candle is an index bump
+                # The candle is already copied into the storage buffer, so
+                # exposing this minute only requires an index advance.
                 short_candle = candles_arr[i]
                 arr_1m.index += 1
             else:
@@ -660,14 +647,9 @@ def _step_simulator(
                     short_candle = candles_pipeline.get_candles(
                         candles_arr[i: i + candles_pipeline._batch_size], i, -1
                     )
-                if i != 0:
-                    short_candle = _get_fixed_jumped_candle(candles_arr[i - 1], short_candle)
-                # Persist the synthetic candle back into the array so the higher-timeframe
-                # generation below (and the next iteration's gap-fix reference) are built from the
-                # SYNTHETIC series — exactly as _skip_simulator does. Without this, larger-timeframe
-                # candles (and therefore the strategy's indicators) were generated from the ORIGINAL
-                # real candles while fills ran on the synthetic prices, so the full (step) simulator
-                # diverged from the fast (skip) simulator on bootstrapped candles — and could blow up.
+
+                # Pipeline output becomes the canonical row used by storage and
+                # higher-timeframe generation for this simulation.
                 candles_arr[i] = short_candle
 
                 add_candle(short_candle, exchange, symbol, '1m', with_execution=False,
@@ -677,7 +659,13 @@ def _step_simulator(
             if print_shorter_period_candles:
                 candle_service.print_candle(short_candle, True, symbol)
 
-            _simulate_price_change_effect(short_candle, exchange, symbol)
+            previous_close = candles_arr[i - 1, 2] if i != 0 else None
+            _simulate_price_change_effect(
+                short_candle,
+                exchange,
+                symbol,
+                previous_close=previous_close,
+            )
 
             # generate and add candles for bigger timeframes
             for timeframe, count in generating_timeframes:
@@ -899,36 +887,213 @@ def _finish_progress_bar(progressbar: Progressbar, run_silently: bool):
     )
 
 
-def _get_fixed_jumped_candle(
-        previous_candle: np.ndarray, candle: np.ndarray
-) -> np.ndarray:
-    """
-    A little workaround for the times that the price has jumped and the opening
-    price of the current candle is not equal to the previous candle's close!
+def _order_is_crossed_by_opening_gap(
+        order: Order,
+        previous_close: float,
+        open_price: float,
+) -> bool:
+    """Return whether a resting limit or stop order became marketable at the open."""
+    if not order.is_active:
+        return False
 
-    :param previous_candle: np.ndarray
-    :param candle: np.ndarray
-    """
-    previous_close = previous_candle[2]
-    candle_open = candle[1]
-    if previous_close < candle_open:
-        candle[1] = previous_close
-        if previous_close < candle[4]:
-            candle[4] = previous_close
-    elif previous_close > candle_open:
-        candle[1] = previous_close
-        if previous_close > candle[3]:
-            candle[3] = previous_close
+    order_price = order.price
+    if order_price is None:
+        return False
 
-    return candle
+    return _priced_order_is_crossed_by_opening_gap(
+        order,
+        order_price,
+        previous_close,
+        open_price,
+    )
 
 
-def _simulate_price_change_effect(real_candle: np.ndarray, exchange: str, symbol: str) -> None:
-    executing_orders = _get_executing_orders(exchange, symbol, real_candle)
+def _priced_order_is_crossed_by_opening_gap(
+        order: Order,
+        order_price: float,
+        previous_close: float,
+        open_price: float,
+) -> bool:
+    """Check a known-active, priced order against one close-to-open transition."""
+    if open_price > previous_close:
+        if not previous_close <= order_price <= open_price:
+            return False
+        return (
+            (order.type == order_types.LIMIT and order.side == sides.SELL)
+            or (order.type == order_types.STOP and order.side == sides.BUY)
+        )
+    if open_price < previous_close:
+        if not open_price <= order_price <= previous_close:
+            return False
+        return (
+            (order.type == order_types.LIMIT and order.side == sides.BUY)
+            or (order.type == order_types.STOP and order.side == sides.SELL)
+        )
+    return False
+
+
+def _get_opening_gap_orders(
+        previous_close: Optional[float],
+        candle: np.ndarray,
+        exchange: str,
+        symbol: str,
+        active_orders: Optional[List[Order]] = None,
+) -> List[Order]:
+    """Return pre-existing orders crossed between the previous close and current open."""
+    open_price = candle[1]
+    if previous_close is None or previous_close == open_price:
+        return []
+
+    if active_orders is None:
+        active_orders = store.orders.get_active_orders(exchange, symbol)
+
+    crossed_orders = [
+        order
+        for order in active_orders
+        if _order_is_crossed_by_opening_gap(order, previous_close, open_price)
+    ]
+    if len(crossed_orders) > 1:
+        crossed_orders.sort(key=lambda order: order.price, reverse=open_price < previous_close)
+    return crossed_orders
+
+
+def _execute_opening_gap_orders(
+        previous_close: Optional[float],
+        candle: np.ndarray,
+        exchange: str,
+        symbol: str,
+        active_orders: Optional[List[Order]] = None,
+        opening_gap_orders: Optional[List[Order]] = None,
+) -> bool:
+    """Execute crossed resting orders at the first available opening price."""
+    orders = opening_gap_orders
+    if orders is None:
+        orders = _get_opening_gap_orders(
+            previous_close,
+            candle,
+            exchange,
+            symbol,
+            active_orders=active_orders,
+        )
+    if not orders:
+        return False
+
+    open_price = candle[1]
+    opening_candle = candle.copy()
+    opening_candle[2:5] = open_price
+    opening_candle[5] = 0
+    _update_all_routes_a_partial_candle(exchange, symbol, opening_candle)
+
+    position = store.positions.get_position(exchange, symbol)
+    if position:
+        position.current_price = open_price
+
+    # Both simulators timestamp fills at the end of the one-minute candle that
+    # exposes the opening price.
+    store.app.time = candle[0] + 60_000
+
+    executed = False
+    for order in orders:
+        # Another fill at this open may close the position and cancel its siblings.
+        if not order.is_active:
+            continue
+
+        # Order.price is the execution price used by accounting. Keep the
+        # submitted trigger or limit available for diagnostics.
+        order.vars = dict(order.vars or {})
+        order.vars['submitted_price'] = order.price
+        order.price = open_price
+        order_service.execute_order(order)
+        executed = True
+
+    return executed
+
+
+def _get_opening_gap_and_executing_orders(
+        active_orders: List[Order],
+        candle: np.ndarray,
+        previous_close: Optional[float],
+) -> Tuple[List[Order], List[Order]]:
+    """Classify active orders for the opening gap and current candle in one pass."""
+    if not active_orders:
+        return [], []
+
+    open_price = candle[1]
+    high = candle[3]
+    low = candle[4]
+    upward_gap = previous_close is not None and open_price > previous_close
+    downward_gap = previous_close is not None and open_price < previous_close
+    opening_gap_orders = []
+    executing_orders = []
+
+    for order in active_orders:
+        if not order.is_active:
+            continue
+        order_price = order.price
+        if order_price is None:
+            continue
+        if low <= order_price <= high:
+            executing_orders.append(order)
+        if (
+            upward_gap
+            and previous_close <= order_price <= open_price
+            and (
+                (order.type == order_types.LIMIT and order.side == sides.SELL)
+                or (order.type == order_types.STOP and order.side == sides.BUY)
+            )
+        ):
+            opening_gap_orders.append(order)
+        elif (
+            downward_gap
+            and open_price <= order_price <= previous_close
+            and (
+                (order.type == order_types.LIMIT and order.side == sides.BUY)
+                or (order.type == order_types.STOP and order.side == sides.SELL)
+            )
+        ):
+            opening_gap_orders.append(order)
+
+    if len(opening_gap_orders) > 1:
+        opening_gap_orders.sort(
+            key=lambda order: order.price,
+            reverse=open_price < previous_close,
+        )
+    return opening_gap_orders, executing_orders
+
+
+def _simulate_price_change_effect(
+        real_candle: np.ndarray,
+        exchange: str,
+        symbol: str,
+        previous_close: Optional[float] = None,
+) -> None:
+    active_orders = store.orders.get_active_orders(exchange, symbol)
+    opening_gap_orders, executing_orders = _get_opening_gap_and_executing_orders(
+        active_orders,
+        real_candle,
+        previous_close,
+    )
+    any_order_executed = False
+    if opening_gap_orders:
+        any_order_executed = _execute_opening_gap_orders(
+            previous_close,
+            real_candle,
+            exchange,
+            symbol,
+            opening_gap_orders=opening_gap_orders,
+        )
+    if any_order_executed:
+        # Fill callbacks can cancel sibling orders or submit new protective orders.
+        active_orders = store.orders.get_active_orders(exchange, symbol)
+        executing_orders = _get_executing_orders(
+            exchange,
+            symbol,
+            real_candle,
+            active_orders=active_orders,
+        )
 
     # the vast majority of candles have no order waiting to be executed inside
     # them, so only pay for the candle copy + execution loop when needed.
-    any_order_executed = False
     if executing_orders:
         current_temp_candle = real_candle.copy()
         if len(executing_orders) > 1:
@@ -980,10 +1145,22 @@ def _simulate_price_change_effect(real_candle: np.ndarray, exchange: str, symbol
     if p:
         p.current_price = real_candle[2]
 
-    _check_for_liquidations(real_candle, exchange, symbol, position=p)
+    _check_for_liquidations(
+        real_candle,
+        exchange,
+        symbol,
+        position=p,
+        previous_close=previous_close,
+    )
 
 
-def _check_for_liquidations(candle: np.ndarray, exchange: str, symbol: str, position: Position = None) -> None:
+def _check_for_liquidations(
+        candle: np.ndarray,
+        exchange: str,
+        symbol: str,
+        position: Position = None,
+        previous_close: Optional[float] = None,
+) -> None:
     # accept an already-fetched position to avoid a second lookup on the hot path
     p: Position = position if position is not None else store.positions.get_position(exchange, symbol)
 
@@ -994,7 +1171,16 @@ def _check_for_liquidations(candle: np.ndarray, exchange: str, symbol: str, posi
     if p.mode != 'isolated':
         return
 
-    if candle_service.candle_includes_price(candle, p.liquidation_price):
+    liquidation_reached = candle_service.candle_includes_price(candle, p.liquidation_price)
+    if previous_close is not None:
+        open_price = candle[1]
+        liquidation_reached = liquidation_reached or (
+            min(previous_close, open_price)
+            <= p.liquidation_price
+            <= max(previous_close, open_price)
+        )
+
+    if liquidation_reached:
         closing_order_side = jh.closing_side(p.type)
 
         # create the market order that is used as the liquidation order
@@ -1074,21 +1260,8 @@ def _skip_simulator(
 
     candles_step = _calculate_minimum_candle_step()
 
-    # Skip-mode analogue of the step simulator's 1m-storage prefill (see
-    # _step_simulator). For pipeline-less pairs, the only mutations the
-    # per-step loop ever applies to the input series are the step-boundary
-    # jumped-candle fixes (the fix reads only the previous candle's close,
-    # which no fix ever writes, so applying them upfront in ascending order is
-    # bit-exact), and each order-free step's add_multiple_1m_candles is a
-    # plain append of those exact rows. So: apply the boundary fixes once,
-    # bulk-copy the fixed series into the 1m storage buffer, and let
-    # order-free steps advance the storage index instead of re-copying rows
-    # every step. Steps in which orders execute keep the original write path
-    # untouched (their per-minute add_candle calls overwrite the prefilled
-    # rows and the trailing add_multiple_1m_candles restores them, exactly as
-    # before). Guards fall back to the original path: if any of them fails,
-    # the pair is simply absent from `prefilled` and is handled exactly as it
-    # used to be (see _step_simulator's prefill for the per-guard rationale).
+    # Pipeline-free, ascending float64 candles can be copied into storage once.
+    # Order-free batches then advance the visible index without copying rows.
     prefilled = {}
     for j in candles:
         candles_arr = candles[j]['candles']
@@ -1105,15 +1278,9 @@ def _skip_simulator(
             # warmup continuity: the series must strictly follow whatever
             # warmup candles already sit in storage
             if base == 0 or candles_arr[0, 0] > storage.array[base - 1, 0]:
-                # the per-step loop gap-fixes ONLY the first candle of each
-                # step against the previous minute; replicate exactly that
-                # (and only that), in the same ascending order
-                for b in range(candles_step, length, candles_step):
-                    _get_fixed_jumped_candle(candles_arr[b - 1], candles_arr[b])
                 needed = base + length
                 if needed > len(storage.array):
-                    # grow the buffer once upfront (same end state that
-                    # DynamicNumpyArray growth reaches)
+                    # Allocate enough room for the complete simulation range.
                     new_array = np.zeros((needed,) + storage.array.shape[1:], dtype=storage.array.dtype)
                     new_array[:base] = storage.array[:base]
                     storage.array = new_array
@@ -1247,36 +1414,27 @@ def _simulate_new_candles(
     # add candles
     for candles_arr, candles_pipeline, exchange, symbol, storage_1m in pairs_info:
         if storage_1m is not None:
-            # gap-fixed upfront and already copied into the 1m storage buffer;
-            # the write-back below would be a self-assignment, so skip it too
+            # These rows are already present in the 1m storage buffer.
             short_candles = candles_arr[i:i_step]
         else:
             short_candles = get_candles_from_pipeline(candles_pipeline, candles_arr, i, candles_step)
             candles_arr[i:i_step] = short_candles
-            if i != 0:
-                previous_short_candles = candles_arr[i - 1]
-                # work the same, the fix needs to be done only on the gap of 1m edge candles.
-                short_candles[0] = _get_fixed_jumped_candle(
-                    previous_short_candles, short_candles[0]
-                )
-
+        previous_close = candles_arr[i - 1, 2] if i != 0 else None
         real_candle = _simulate_price_change_effect_multiple_candles(
-            short_candles, exchange, symbol, storage_1m
+            short_candles,
+            exchange,
+            symbol,
+            storage_1m,
+            previous_close=previous_close,
         )
 
         # generate and add candles for bigger timeframes
         for timeframe, count in htf_info:
             if i_step % count == 0:
                 if count == candles_step and (storage_1m is not None or candles_pipeline is None):
-                    # the step's real candle was just built from these exact
-                    # rows through the exact same code path (same <=4320/dtype
-                    # branch), so rebuilding it would be bit-identical work.
-                    # Gated to the cases where short_candles are views of
-                    # candles_arr (prefill, or no pipeline): with a pipeline,
-                    # short_candles is the pipeline's own buffer and the
-                    # jump-fix lands after the write-back, so the historical
-                    # behavior built the HTF candle from the pre-fix rows in
-                    # candles_arr — rebuild below to preserve that exactly.
+                    # The batch aggregate already represents this complete
+                    # higher-timeframe candle, provided the rows came directly
+                    # from the canonical candle array.
                     generated_candle = real_candle
                 else:
                     generated_candle = generate_candle_from_one_minutes(
@@ -1297,6 +1455,7 @@ def _simulate_new_candles(
 def _simulate_price_change_effect_multiple_candles(
         short_timeframes_candles: np.ndarray, exchange: str, symbol: str,
         prefilled_storage_1m=None,
+        previous_close: Optional[float] = None,
 ) -> np.ndarray:
     if len(short_timeframes_candles) <= 4320 and short_timeframes_candles.dtype == np.float64:
         # bit-exact Rust kernel for the common case (see generate_candle_from_one_minutes)
@@ -1312,17 +1471,48 @@ def _simulate_price_change_effect_multiple_candles(
                 short_timeframes_candles[:, 5].sum(),
             ]
         )
-    executing_orders = _get_executing_orders(exchange, symbol, real_candle)
-    had_executing_orders = len(executing_orders) > 0
-    if len(executing_orders) > 0:
+    active_orders = store.orders.get_active_orders(exchange, symbol)
+    boundary_gap_orders, executing_orders = _get_opening_gap_and_executing_orders(
+        active_orders,
+        real_candle,
+        previous_close,
+    )
+    # Internal gaps are bounded by this aggregate candle's high and low, so an
+    # order inside one already appears in executing_orders. Only the transition
+    # from the previous batch needs a separate boundary-gap result.
+    had_executing_orders = bool(executing_orders) or bool(boundary_gap_orders)
+    if had_executing_orders:
         if len(executing_orders) > 1:
             executing_orders = _sort_execution_orders(executing_orders, short_timeframes_candles)
 
         for i in range(len(short_timeframes_candles)):
             current_temp_candle = short_timeframes_candles[i].copy()
-            if i > 0:
-                current_temp_candle[3] = max(current_temp_candle[3], short_timeframes_candles[i-1, 2])
-                current_temp_candle[4] = min(current_temp_candle[4], short_timeframes_candles[i-1, 2])
+            candle_previous_close = (
+                short_timeframes_candles[i - 1, 2]
+                if i > 0
+                else previous_close
+            )
+            opening_gap_executed = _execute_opening_gap_orders(
+                candle_previous_close,
+                current_temp_candle,
+                exchange,
+                symbol,
+                active_orders=active_orders,
+            )
+            if opening_gap_executed:
+                # Fill callbacks can change the active set before intrabar execution.
+                active_orders = store.orders.get_active_orders(exchange, symbol)
+                executing_orders = _get_executing_orders(
+                    exchange,
+                    symbol,
+                    real_candle,
+                    active_orders=active_orders,
+                )
+                if len(executing_orders) > 1:
+                    executing_orders = _sort_execution_orders(
+                        executing_orders,
+                        short_timeframes_candles[i:],
+                    )
             is_executed_order = False
 
             while True:
@@ -1351,8 +1541,12 @@ def _simulate_price_change_effect_multiple_candles(
 
                             store.app.time = storable_temp_candle[0] + 60_000
                             order_service.execute_order(order)
+                            active_orders = store.orders.get_active_orders(exchange, symbol)
                             executing_orders = _get_executing_orders(
-                                exchange, symbol, real_candle
+                                exchange,
+                                symbol,
+                                real_candle,
+                                active_orders=active_orders,
                             )
 
                             # break from the for loop, we'll try again inside the while
@@ -1377,12 +1571,8 @@ def _simulate_price_change_effect_multiple_candles(
                     break
 
     if prefilled_storage_1m is not None and not had_executing_orders:
-        # the rows for this step are already sitting (gap-fixed) in the
-        # storage buffer right after the current index, and nothing executed,
-        # so add_multiple_1m_candles' append is just an index advance. When
-        # orders DID execute, the per-minute loop above already advanced the
-        # index via add_candle, and add_multiple_1m_candles must run its
-        # override branch to restore the real rows — exactly as before.
+        # The batch is already stored and no partial execution candles need
+        # replacing, so only the visible storage index must advance.
         prefilled_storage_1m.index += len(short_timeframes_candles)
     else:
         candle_service.add_multiple_1m_candles(
@@ -1391,7 +1581,12 @@ def _simulate_price_change_effect_multiple_candles(
             symbol,
         )
     store.app.time = real_candle[0] + (60_000 * len(short_timeframes_candles))
-    _check_for_liquidations(real_candle, exchange, symbol)
+    _check_for_liquidations(
+        real_candle,
+        exchange,
+        symbol,
+        previous_close=previous_close,
+    )
 
     p = store.positions.get_position(exchange, symbol)
     if p:
@@ -1464,16 +1659,22 @@ def _execute_routes(candle_index: int, candles_step: int) -> None:
         order_service.update_active_orders(r.exchange, r.symbol)
 
 
-def _get_executing_orders(exchange, symbol, real_candle):
-    orders = store.orders.get_active_orders(exchange, symbol)
-    if not orders:
+def _get_executing_orders(
+        exchange: str,
+        symbol: str,
+        real_candle: np.ndarray,
+        active_orders: Optional[List[Order]] = None,
+) -> List[Order]:
+    if active_orders is None:
+        active_orders = store.orders.get_active_orders(exchange, symbol)
+    if not active_orders:
         return []
     # inlined candle_includes_price() with the candle's high/low hoisted out of the loop
     high = real_candle[3]
     low = real_candle[4]
     return [
         order
-        for order in orders
+        for order in active_orders
         if order.is_active and low <= order.price <= high
     ]
 
