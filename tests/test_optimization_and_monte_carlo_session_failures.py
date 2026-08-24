@@ -1,4 +1,5 @@
 import asyncio
+import json
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -11,6 +12,20 @@ optimization_controller = import_module('jesse.controllers.optimization_controll
 monte_carlo_model = import_module('jesse.models.MonteCarloSession')
 monte_carlo_mode = import_module('jesse.modes.monte_carlo_mode')
 monte_carlo_controller = import_module('jesse.controllers.monte_carlo_controller')
+transformers = import_module('jesse.services.transformers')
+
+
+def test_monte_carlo_summary_metrics_allow_zero_valid_scenarios():
+    # A completed run can legitimately have no valid scenarios, so its confidence
+    # analysis has explanatory metadata but no metrics collection.
+    results = json.dumps({
+        'confidence_analysis': {
+            'interpretation': 'No valid scenarios were available for analysis.',
+        },
+    })
+
+    assert transformers._extract_candles_summary_metrics(results) == []
+    assert transformers._extract_trades_summary_metrics(results) == []
 
 
 @pytest.mark.parametrize(

@@ -28,6 +28,7 @@ from typing import Optional
 
 import jesse.mcp.mcp_config as mcp_config
 from .auth import hash_password
+from .session_config import load_session_run_config, monte_carlo_engine_config
 
 
 def _default_cpu_cores() -> int:
@@ -37,49 +38,14 @@ def _default_cpu_cores() -> int:
         return 2
 
 
-# Standard parameters for the moving_block_bootstrap candle pipeline. These
-# match the dashboard's hardcoded defaults — the dashboard's `newSession`
-# action reads them as plain numbers, so passing null/None here crashes the
-# UI when a user opens the session.
+# Standard parameters for the moving_block_bootstrap candle pipeline. The
+# Dashboard session form requires each value to be a concrete number.
 _DEFAULT_MOVING_BLOCK_BOOTSTRAP_PARAMS = {
     'batch_size': 10080,
     'close_sigma': 0.001,
     'high_sigma': 0.0001,
     'low_sigma': 0.0001,
 }
-
-
-def _default_mc_config(exchange_name: Optional[str]) -> dict:
-    """
-    Build the config payload the Monte Carlo runner expects.
-
-    MonteCarloRunner reads `user_config['exchange']` (singular dict), which
-    is a DIFFERENT shape from the dashboard's `backtest` config section
-    (which has a plural `exchanges` dict keyed by name). Sending the
-    backtest config here triggers KeyError: 'exchange' inside the runner.
-
-    We mirror the same hardcoded-default approach used by the significance
-    test service, inferring `type` from the exchange name so Spot exchanges
-    don't get tagged as `futures`.
-    """
-    name = (exchange_name or '').lower()
-    is_spot = 'spot' in name
-    exchange = {
-        'balance': 10_000,
-        'fee': 0.0006,
-        'type': 'spot' if is_spot else 'futures',
-    }
-    if not is_spot:
-        exchange['futures_leverage'] = 1
-        exchange['futures_leverage_mode'] = 'cross'
-    return {
-        'warm_up_candles': 210,
-        # MonteCarloRunner reads starting_balance + fee at the TOP LEVEL (not inside exchange),
-        # so they must be surfaced here or they silently fall back to defaults (10000 / 0.0005).
-        'starting_balance': exchange['balance'],
-        'fee': exchange['fee'],
-        'exchange': exchange,
-    }
 
 
 def _build_default_title(routes_list: list) -> str:
@@ -204,7 +170,7 @@ def create_monte_carlo_draft_service(
     num_scenarios: int = 200,
     run_trades: bool = False,
     run_candles: bool = True,
-    fast_mode: bool = True,  # robust path; the step simulator blows up on synthetic candles (see tool doc)
+    fast_mode: bool = True,
     cpu_cores: Optional[int] = None,
     pipeline_type: Optional[str] = 'moving_block_bootstrap',
     pipeline_params: Optional[str] = None,
@@ -247,16 +213,20 @@ def create_monte_carlo_draft_service(
             except json.JSONDecodeError as e:
                 return {'status': 'error', 'message': 'Invalid JSON for pipeline_params', 'details': str(e)}
 
-        # Always persist a non-null pipeline_params object — the dashboard's
-        # session-clone path reads sub-keys directly and crashes on null.
-        # Defaults only apply when the pipeline is moving_block_bootstrap;
-        # custom pipelines must supply their own params.
+        # The Dashboard reads pipeline parameter fields directly, so every
+        # session stores an object. Only the built-in pipeline receives defaults.
         if parsed_pipeline_params is None:
             parsed_pipeline_params = (
                 dict(_DEFAULT_MOVING_BLOCK_BOOTSTRAP_PARAMS)
                 if resolved_pipeline_type == 'moving_block_bootstrap'
                 else {}
             )
+
+        run_config = load_session_run_config(
+            'monte_carlo',
+            exchange,
+            {'cpu_cores': int(cpu_cores) if cpu_cores is not None else _default_cpu_cores()},
+        )
 
         form_data = {
             'id': session_id,
@@ -269,9 +239,9 @@ def create_monte_carlo_draft_service(
             'run_trades': bool(run_trades),
             'run_candles': bool(run_candles),
             'fast_mode': bool(fast_mode),
-            'cpu_cores': int(cpu_cores) if cpu_cores is not None else _default_cpu_cores(),
             'pipeline_type': resolved_pipeline_type,
             'pipeline_params': parsed_pipeline_params,
+            'config': run_config,
         }
 
         state_dict = {
@@ -555,20 +525,34 @@ def get_monte_carlo_logs_service(session_id: str) -> dict:
         return {'status': 'error', 'error': str(e), 'message': 'Failed to retrieve Monte Carlo logs'}
 
 
-def _build_run_payload(session_id: str, form: dict, config: dict, state: dict) -> dict:
+def _build_run_payload(session_id: str, form: dict, state: dict) -> dict:
+    overrides = {}
+    if 'cpu_cores' in form:
+        overrides['cpu_cores'] = form['cpu_cores']
+    if 'warm_up_candles' in form:
+        overrides['warm_up_candles'] = form['warm_up_candles']
+    if isinstance(form.get('config'), dict):
+        overrides.update(form['config'])
+    run_config = load_session_run_config(
+        'monte_carlo',
+        form.get('exchange'),
+        overrides,
+    )
+    form['config'] = run_config
+    state['form'] = form
     return {
         'id': session_id,
         'exchange': form.get('exchange'),
         'routes': form.get('routes', []),
         'data_routes': form.get('data_routes', []),
-        'config': config,
+        'config': monte_carlo_engine_config(run_config),
         'start_date': form.get('start_date'),
         'finish_date': form.get('finish_date'),
         'run_trades': bool(form.get('run_trades', False)),
         'run_candles': bool(form.get('run_candles', True)),
         'num_scenarios': int(form.get('num_scenarios', 200)),
         'fast_mode': bool(form.get('fast_mode', True)),
-        'cpu_cores': int(form.get('cpu_cores', _default_cpu_cores())),
+        'cpu_cores': int(run_config['cpu_cores']),
         'pipeline_type': form.get('pipeline_type') or 'moving_block_bootstrap',
         'pipeline_params': form.get('pipeline_params'),
         'state': state if isinstance(state, dict) else {},
@@ -638,13 +622,8 @@ def _run_or_resume(session_id: str, op_label: str) -> dict:
     """
     Shared implementation for run_monte_carlo / resume_monte_carlo.
 
-    Both go to POST /monte-carlo/resume, not POST /monte-carlo. The main
-    endpoint rejects any pre-existing session row with 409, but our
-    create_monte_carlo_draft has already created the row to persist the
-    form. /resume is the endpoint that *requires* an existing row and
-    kicks off the worker. (significance_test's controller has explicit
-    draft-promotion in its main endpoint, which the MC controller does
-    not — so we work around it here.)
+    MCP drafts already own a database row, and the resume endpoint is the
+    controller contract for launching a worker from that persisted row.
     """
     api_url = mcp_config.JESSE_API_URL
     password = mcp_config.JESSE_PASSWORD
@@ -677,7 +656,7 @@ def _run_or_resume(session_id: str, op_label: str) -> dict:
                 ),
             }
 
-        payload = _build_run_payload(session_id, form, _default_mc_config(form.get('exchange')), state)
+        payload = _build_run_payload(session_id, form, state)
         return _fire(api_url, auth, '/monte-carlo/resume', payload)
 
     except requests.exceptions.RequestException as e:

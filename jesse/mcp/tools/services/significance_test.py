@@ -22,18 +22,7 @@ from typing import Optional
 
 import jesse.mcp.mcp_config as mcp_config
 from .auth import hash_password
-
-
-DEFAULT_SIG_TEST_CONFIG = {
-    'warm_up_candles': 210,
-    'exchange': {
-        'balance': 10_000,
-        'fee': 0.0006,
-        'type': 'futures',
-        'futures_leverage': 1,
-        'futures_leverage_mode': 'cross',
-    },
-}
+from .session_config import load_session_run_config
 
 
 def _build_default_title(routes_list: list) -> str:
@@ -172,6 +161,7 @@ def create_significance_test_draft_service(
         if len(routes_list) != 1:
             return {'status': 'error', 'message': 'Rule Significance Test requires exactly one trading route.'}
 
+        run_config = load_session_run_config('significance_test', exchange)
         form_data = {
             'id': session_id,
             'exchange': exchange,
@@ -181,6 +171,7 @@ def create_significance_test_draft_service(
             'finish_date': finish_date,
             'n_simulations': int(n_simulations),
             'random_seed': int(random_seed) if random_seed is not None else None,
+            'config': run_config,
         }
 
         state_dict = {
@@ -436,12 +427,19 @@ def run_significance_test_service(session_id: str) -> dict:
         if len(routes_list) != 1:
             return {'status': 'error', 'message': 'Rule Significance Test requires exactly one trading route.'}
 
+        run_config = load_session_run_config(
+            'significance_test',
+            form.get('exchange'),
+            form.get('config'),
+        )
+        form['config'] = run_config
+        state['form'] = form
         payload = {
             'id': session_id,
             'exchange': form.get('exchange'),
             'routes': routes_list,
             'data_routes': form.get('data_routes', []),
-            'config': DEFAULT_SIG_TEST_CONFIG,
+            'config': run_config,
             'start_date': form.get('start_date'),
             'finish_date': form.get('finish_date'),
             'n_simulations': int(form.get('n_simulations', 2000)),

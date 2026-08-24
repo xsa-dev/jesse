@@ -37,6 +37,7 @@ class BacktestRequestJson(BaseModel):
     fast_mode: bool
     benchmark: bool
     theme: str = 'light'
+    state: dict
 
 
 class OptimizationRequestJson(BaseModel):
@@ -387,7 +388,7 @@ class SignificanceTestRequestJson(BaseModel):
     n_simulations: int = 1000
     random_seed: Optional[int] = None
     theme: str = 'light'
-    state: dict = {}
+    state: dict
 
 
 class CancelSignificanceTestRequestJson(BaseModel):

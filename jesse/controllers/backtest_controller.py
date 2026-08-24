@@ -34,6 +34,10 @@ def backtest(request_json: BacktestRequestJson):
 
     jh.validate_cwd()
 
+    # Persist the exact configuration accepted for this run before the worker can
+    # update the same session with progress and results.
+    update_backtest_session_state(request_json.id, request_json.state)
+
     process_manager.add_task(
         run_backtest,
         request_json.id,

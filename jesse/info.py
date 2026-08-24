@@ -52,7 +52,7 @@ exchange_info = {
         "url": JESSE_WEBSITE_URL + "/kucoin",
         "fee": 0.001,  # spot taker fee 0.1%
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": KUCOIN_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -141,7 +141,7 @@ exchange_info = {
         "url": "https://jesse.trade/bybit",
         "fee": 0.001,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BYBIT_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -155,7 +155,7 @@ exchange_info = {
         "url": "https://jesse.trade/bybit",
         "fee": 0.001,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BYBIT_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -169,7 +169,7 @@ exchange_info = {
         "url": "https://bitfinex.com",
         "fee": 0.002,
         "type": "spot",
-        "supported_leverage_modes": ["cross"],
+        "supported_leverage_modes": [],
         "supported_timeframes": [
             timeframes.MINUTE_1,
             timeframes.MINUTE_5,
@@ -193,7 +193,7 @@ exchange_info = {
         "url": "https://binance.com",
         "fee": 0.001,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BINANCE_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -207,7 +207,7 @@ exchange_info = {
         "url": "https://binance.us",
         "fee": 0.001,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BINANCE_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -249,7 +249,7 @@ exchange_info = {
         "url": "https://www.coinbase.com/advanced-trade/spot/BTC-USD",
         "fee": 0.0003,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": COINBASE_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -301,7 +301,7 @@ exchange_info = {
         "url": "https://jesse.trade/gate",
         "fee": 0.0005,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": GATE_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -329,7 +329,7 @@ exchange_info = {
         "url": "https://ftx.com/markets/spot",
         "fee": 0.0007,
         "type": "spot",
-        "supported_leverage_modes": ["cross"],
+        "supported_leverage_modes": [],
         "supported_timeframes": FTX_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -343,7 +343,7 @@ exchange_info = {
         "url": "https://ftx.us",
         "fee": 0.002,
         "type": "spot",
-        "supported_leverage_modes": ["cross"],
+        "supported_leverage_modes": [],
         "supported_timeframes": FTX_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -385,7 +385,7 @@ exchange_info = {
         "url": JESSE_WEBSITE_URL + "/bitget",
         "fee": 0.0006,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BITGET_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -489,7 +489,7 @@ exchange_info = {
         # We use 0.0026 as a representative value; the real fee depends on the account's 30d volume tier.
         "fee": 0.0026,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": KRAKEN_TIMEFRAMES,
         "modes": {
             # Kraken's public OHLC REST endpoint only serves the most recent 720 candles
