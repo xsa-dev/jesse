@@ -13,6 +13,7 @@ from jesse.models.SignificanceTestSession import (
     store_significance_test_exception,
 )
 from .SignificanceTestRunner import SignificanceTestRunner
+from jesse.research.backtest import _reset_research_runtime_state
 
 
 def run(
@@ -31,6 +32,7 @@ def run(
     from jesse.config import config, set_config
     config['app']['trading_mode'] = 'significance-test'
 
+    runner_started = False
     try:
         if len(routes) != 1:
             raise ValueError('Rule Significance Test requires exactly one trading route.')
@@ -80,6 +82,7 @@ def run(
             theme=theme,
             cpu_cores=1,
         )
+        runner_started = True
         runner.run()
     except Exception as e:
         import traceback as _tb
@@ -96,6 +99,11 @@ def run(
             )
         else:
             message = f'{type(e).__name__}: {e}'
-        store_significance_test_exception(session_id, message, _tb.format_exc())
-        update_significance_test_session_status(session_id, 'stopped')
+        # Execution failures are persisted by the runner. This branch owns only
+        # setup failures that happen before the runner begins.
+        if not runner_started:
+            store_significance_test_exception(session_id, message, _tb.format_exc())
+            update_significance_test_session_status(session_id, 'stopped')
         raise
+    finally:
+        _reset_research_runtime_state()

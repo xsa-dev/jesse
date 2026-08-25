@@ -1,7 +1,6 @@
 import os
 import time
 import traceback
-from datetime import timedelta
 from typing import Dict, List, Optional
 
 import jesse.helpers as jh
@@ -41,25 +40,23 @@ class SignificanceTestRunner:
 
         self.start_time = jh.now_to_timestamp()
 
-        # Periodic termination check
-        client_id = jh.get_session_id()
-        from timeloop import Timeloop
-        self.tl = Timeloop()
+        self.client_id = jh.get_session_id()
 
-        @self.tl.job(interval=timedelta(seconds=1))
-        def check_for_termination():
-            if is_process_active(client_id) is False:
-                session = get_significance_test_session_by_id(self.session_id)
-                if session and session.status != 'terminated':
-                    update_significance_test_session_status(self.session_id, 'stopped')
-                raise exceptions.Termination
+    def _raise_if_cancelled(self) -> None:
+        """Stop inside the active execution path when cancellation is requested."""
+        if not is_process_active(self.client_id):
+            raise exceptions.Termination
 
-        self.tl.start()
+    def _mark_stopped_unless_terminated(self) -> None:
+        """Preserve the explicit terminal status selected by the user."""
+        session = get_significance_test_session_by_id(self.session_id)
+        if session is None or session.status not in {'stopped', 'terminated'}:
+            update_significance_test_session_status(self.session_id, 'stopped')
 
     def run(self) -> None:
-        jh.debug(f"Rule Significance Test started: {self.n_simulations} simulations")
-
         try:
+            jh.debug(f"Rule Significance Test started: {self.n_simulations} simulations")
+            self._raise_if_cancelled()
             self._publish_general_info()
             self._run_significance_test()
             update_significance_test_session_status(self.session_id, 'finished')
@@ -73,24 +70,19 @@ class SignificanceTestRunner:
             })
 
         except exceptions.Termination:
-            update_significance_test_session_status(self.session_id, 'stopped')
+            self._mark_stopped_unless_terminated()
             raise
 
         except Exception as e:
             error_traceback = traceback.format_exc()
+            error = f'{type(e).__name__}: {e}'
             update_significance_test_session_status(self.session_id, 'stopped')
-            store_significance_test_exception(self.session_id, str(e), error_traceback)
+            store_significance_test_exception(self.session_id, error, error_traceback)
             sync_publish('exception', {
-                'error': str(e),
+                'error': error,
                 'traceback': error_traceback
             })
             raise
-
-        finally:
-            try:
-                self.tl.stop()
-            except Exception:
-                pass
 
     def _publish_general_info(self):
         sync_publish('general_info', {
@@ -118,6 +110,7 @@ class SignificanceTestRunner:
 
         def progress_callback(current_progress: int, total_progress: int):
             nonlocal last_update_time
+            self._raise_if_cancelled()
             current_time = time.time()
             should_publish = (
                 last_update_time is None
@@ -157,6 +150,7 @@ class SignificanceTestRunner:
             progress_bar=False,
             progress_callback=progress_callback,
         )
+        self._raise_if_cancelled()
 
         # Publish completion progress
         sync_publish('progressbar', {
@@ -173,8 +167,7 @@ class SignificanceTestRunner:
             theme=self.theme,
             show_title=False,
         )
-
-
+        self._raise_if_cancelled()
 
         # Store safe serializable results (simulated_means is a numpy array → list)
         safe_result = {

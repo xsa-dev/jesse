@@ -98,16 +98,23 @@ class ProcessManager:
         w = Process(target=function, args=args)
         with self._workers_lock:
             self._workers.append(w)
-            w.start()
+
+            # The worker may check its active marker immediately, so publish it
+            # before the child can begin executing. This also makes cancellation
+            # a reliable cooperative signal instead of a startup race.
+            self._pending_worker_removals.discard(client_id)
+            self._add_process(client_id)
+            try:
+                w.start()
+            except Exception:
+                self._workers.remove(w)
+                self._remove_active_worker(client_id)
+                raise
 
             prefixed_pid = self._prefixed_pid(w.pid)
             prefixed_client_id = self._prefixed_client_id(client_id)
             self._pid_to_client_id_map[prefixed_pid] = prefixed_client_id
             self.client_id_to_pid_to_map[prefixed_client_id] = prefixed_pid
-            # A new worker owns this Redis marker now, so an older deferred
-            # cleanup must never remove it after a reconnect.
-            self._pending_worker_removals.discard(client_id)
-            self._add_process(client_id)
 
     def get_client_id(self, pid):
         try:

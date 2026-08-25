@@ -19,6 +19,7 @@ from jesse.models.MonteCarloSession import (
     store_candles_session,
     store_session_exception,
 )
+from jesse.research.backtest import _reset_research_runtime_state
 
 
 def run(
@@ -41,6 +42,7 @@ def run(
     from jesse.config import config, set_config
     config['app']['trading_mode'] = 'monte-carlo'
 
+    runner_started = False
     try:
         if not run_trades and not run_candles:
             raise ValueError('At least one Monte Carlo type (trades or candles) must be selected.')
@@ -114,32 +116,36 @@ def run(
             pipeline_params=pipeline_params
         )
 
+        runner_started = True
         runner.run()
     except Exception as e:
         import traceback as _tb
         message = f'{type(e).__name__}: {e}'
         traceback_str = _tb.format_exc()
 
-        try:
-            if get_monte_carlo_session_by_id(session_id) is None:
-                store_monte_carlo_session(id=session_id, status='stopped', state=state)
-            else:
-                update_monte_carlo_session_status(session_id, 'stopped')
+        if not runner_started:
+            try:
+                if get_monte_carlo_session_by_id(session_id) is None:
+                    store_monte_carlo_session(id=session_id, status='stopped', state=state)
+                else:
+                    update_monte_carlo_session_status(session_id, 'stopped')
 
-            if run_trades:
-                trades_session = get_trades_session_by_parent_id(session_id)
-                trades_session_id = str(trades_session.id) if trades_session else store_trades_session(session_id, num_scenarios)
-                store_session_exception(trades_session_id, 'trades', message, traceback_str)
+                if run_trades:
+                    trades_session = get_trades_session_by_parent_id(session_id)
+                    trades_session_id = str(trades_session.id) if trades_session else store_trades_session(session_id, num_scenarios)
+                    store_session_exception(trades_session_id, 'trades', message, traceback_str)
 
-            if run_candles:
-                candles_session = get_candles_session_by_parent_id(session_id)
-                candles_session_id = str(candles_session.id) if candles_session else store_candles_session(
-                    session_id,
-                    num_scenarios,
-                    pipeline_type or 'moving_block_bootstrap',
-                    pipeline_params or {},
-                )
-                store_session_exception(candles_session_id, 'candles', message, traceback_str)
-        except Exception:
-            pass
+                if run_candles:
+                    candles_session = get_candles_session_by_parent_id(session_id)
+                    candles_session_id = str(candles_session.id) if candles_session else store_candles_session(
+                        session_id,
+                        num_scenarios,
+                        pipeline_type or 'moving_block_bootstrap',
+                        pipeline_params or {},
+                    )
+                    store_session_exception(candles_session_id, 'candles', message, traceback_str)
+            except Exception:
+                pass
         raise
+    finally:
+        _reset_research_runtime_state()
