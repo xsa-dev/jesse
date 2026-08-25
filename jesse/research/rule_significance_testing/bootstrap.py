@@ -6,7 +6,7 @@ simulate what chance alone could produce.
 
 Steps
 -----
-1. Zero-centre the rule's daily returns by subtracting the observed mean.
+1. Zero-centre the rule's bar returns by subtracting the observed mean.
    This enforces H0: the rule has no edge (expected return = 0).
 2. Resample the zero-centred returns with replacement N times and compute
    the mean of each resample → the bootstrap sampling distribution.
@@ -35,8 +35,12 @@ def run_bootstrap_test(
         Called each time a batch completes. batch_index is 1-based.
     """
     centered = rule_returns - observed_mean
-    
-    # We split into batches equal to the `cpu_cores` parameter to maintain 
+
+    # Keep one random stream across every batch so changing the batch count
+    # cannot change a seeded experiment's bootstrap samples.
+    rng = np.random.default_rng(random_seed)
+
+    # We split into batches equal to the `cpu_cores` parameter to maintain
     # compatibility with the progress bar initialized in rule_significance.py
     # which expects exactly `cpu_cores` updates.
     batch_sizes = _split_into_batches(n_simulations, max(1, cpu_cores))
@@ -44,8 +48,8 @@ def run_bootstrap_test(
 
     parts = []
     completed = 0
-    
-    for i, batch_size in enumerate(batch_sizes):
+
+    for batch_size in batch_sizes:
         if batch_size == 0:
             completed += 1
             if pbar is not None:
@@ -56,15 +60,14 @@ def run_bootstrap_test(
                 except Exception:
                     pass
             continue
-            
-        rng = np.random.default_rng(random_seed + i)
+
         n = len(centered)
-        
+
         # Resample and compute means for this batch
         idx = rng.integers(0, n, size=(batch_size, n))
         batch_means = centered[idx].mean(axis=1)
         parts.append(batch_means)
-        
+
         completed += 1
         if pbar is not None:
             pbar.update(1)

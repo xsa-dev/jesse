@@ -1,4 +1,6 @@
+from copy import deepcopy
 import random
+import sys
 
 import numpy as np
 import pytest
@@ -6,6 +8,10 @@ import pytest
 import jesse.helpers as jh
 import jesse.indicators as ta
 from jesse import research
+from jesse.config import config
+from jesse.research.rule_significance_testing.common import _annualization_factor
+from jesse.routes import router
+from jesse.store import store
 from jesse.strategies import Strategy
 
 
@@ -94,6 +100,72 @@ def _run_significance_test(strategy: type[Strategy]) -> dict:
     )
 
 
+def _alignment_inputs(strategy: str = 'TestRuleSignificanceAlignment') -> tuple:
+    """Build a market whose next return always agrees with an alternating signal."""
+    exchange = 'Rule Significance Exchange'
+    symbol = 'TEST-USDT'
+    observation_count = 120
+    edge = 0.002
+    signals = np.where(np.arange(observation_count) % 2 == 0, 1.0, -1.0)
+    prices = 100 * np.exp(np.concatenate(([0.0], np.cumsum(signals * edge))))
+    candle_array = research.candles_from_close_prices(prices.tolist())
+
+    config_input = {
+        'starting_balance': 10_000,
+        'fee': 0,
+        'type': 'futures',
+        'futures_leverage': 1,
+        'futures_leverage_mode': 'cross',
+        'exchange': exchange,
+        'warm_up_candles': 0,
+    }
+    routes = [{
+        'exchange': exchange,
+        'strategy': strategy,
+        'symbol': symbol,
+        'timeframe': '1m',
+    }]
+    candles = {
+        jh.key(exchange, symbol): {
+            'exchange': exchange,
+            'symbol': symbol,
+            'candles': candle_array,
+        },
+    }
+    return config_input, routes, candles, edge
+
+
+def _assert_inputs_unchanged(
+    config_input: dict,
+    routes: list,
+    candles: dict,
+    expected_config: dict,
+    expected_routes: list,
+    expected_candles: dict,
+) -> None:
+    assert config_input == expected_config
+    assert routes == expected_routes
+    assert candles.keys() == expected_candles.keys()
+    for key, candle_set in candles.items():
+        assert candle_set['exchange'] == expected_candles[key]['exchange']
+        assert candle_set['symbol'] == expected_candles[key]['symbol']
+        assert np.array_equal(candle_set['candles'], expected_candles[key]['candles'])
+
+
+def _assert_research_runtime_is_clean() -> None:
+    assert config['app']['trading_mode'] == ''
+    assert router.routes == []
+    assert router.data_routes == []
+    api_module = sys.modules.get('jesse.services.api')
+    if api_module is not None:
+        assert api_module.api.drivers == {}
+    assert store.vars == {}
+    assert store.exchanges.storage == {}
+    assert store.orders.storage == {}
+    assert jh.is_backtesting() is False
+    assert jh.is_optimizing() is False
+
+
 def test_noise_signal_is_not_statistically_significant():
     result = _run_significance_test(NoiseSignal)
 
@@ -113,3 +185,85 @@ def test_supertrend_signal_is_statistically_significant():
     assert result['annualized_return'] == pytest.approx(
         result['observed_mean'] * 525_600
     )
+
+
+def test_successful_significance_run_is_aligned_reproducible_and_isolated():
+    config_input, routes, candles, edge = _alignment_inputs()
+    expected_config = deepcopy(config_input)
+    expected_routes = deepcopy(routes)
+    expected_candles = deepcopy(candles)
+
+    single_batch = research.rule_significance_test(
+        config_input,
+        routes,
+        [],
+        candles,
+        n_simulations=257,
+        random_seed=7,
+        cpu_cores=1,
+    )
+    multiple_batches = research.rule_significance_test(
+        config_input,
+        routes,
+        [],
+        candles,
+        n_simulations=257,
+        random_seed=7,
+        cpu_cores=3,
+    )
+
+    assert single_batch['n_observations'] == 120
+    assert single_batch['n_simulations'] == 257
+    assert single_batch['observed_mean'] == pytest.approx(edge)
+    assert single_batch['annualized_return'] == pytest.approx(edge * 525_600)
+    assert single_batch['p_value'] == 0
+    assert np.array_equal(
+        single_batch['simulated_means'],
+        multiple_batches['simulated_means'],
+    )
+    assert single_batch['p_value'] == multiple_batches['p_value']
+    _assert_inputs_unchanged(
+        config_input,
+        routes,
+        candles,
+        expected_config,
+        expected_routes,
+        expected_candles,
+    )
+    _assert_research_runtime_is_clean()
+
+
+def test_significance_run_cleans_runtime_after_strategy_failure():
+    config_input, routes, candles, _ = _alignment_inputs('TestRuleSignificanceFailure')
+    expected_config = deepcopy(config_input)
+    expected_routes = deepcopy(routes)
+    expected_candles = deepcopy(candles)
+
+    with pytest.raises(RuntimeError, match='intentional significance strategy failure'):
+        research.rule_significance_test(
+            config_input,
+            routes,
+            [],
+            candles,
+            n_simulations=10,
+            random_seed=7,
+            cpu_cores=2,
+        )
+
+    _assert_inputs_unchanged(
+        config_input,
+        routes,
+        candles,
+        expected_config,
+        expected_routes,
+        expected_candles,
+    )
+    _assert_research_runtime_is_clean()
+
+
+@pytest.mark.parametrize(
+    ('timeframe', 'expected_bars_per_year'),
+    [('1m', 525_600), ('1h', 8_760), ('1D', 365)],
+)
+def test_annualization_uses_route_timeframe(timeframe, expected_bars_per_year):
+    assert _annualization_factor(timeframe) == expected_bars_per_year

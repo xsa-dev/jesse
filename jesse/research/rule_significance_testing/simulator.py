@@ -17,7 +17,7 @@ import numpy as np
 from typing import List, Dict, Optional
 
 import jesse.helpers as jh
-from jesse.config import config as jesse_config, reset_config, set_config
+from jesse.config import config as jesse_config, set_config
 from jesse.routes import router
 from jesse.store import store
 from jesse.services import candle_service, exchange_service, order_service, position_service
@@ -30,7 +30,11 @@ from jesse.modes.backtest_mode import (
 
 # Reuse _format_config from the research backtest module so the config dict
 # accepted here is identical to what backtest() and monte_carlo_candles() accept.
-from jesse.research.backtest import _format_config
+from jesse.research.backtest import (
+    _format_config,
+    _reset_research_runtime_state,
+    _validate_contiguous_one_minute_candles,
+)
 
 
 def run_signal_only_backtest(
@@ -67,9 +71,34 @@ def run_signal_only_backtest(
     close_prices   : np.ndarray[float64] shape (N,)
     signals        : np.ndarray[int8]    shape (N,)
     """
-    # ------------------------------------------------------------------
-    # Initialisation – identical to _isolated_backtest()
-    # ------------------------------------------------------------------
+    # Validate before touching process-wide state so malformed input cannot
+    # partially initialize a research session.
+    _validate_contiguous_one_minute_candles(candles)
+    _reset_research_runtime_state()
+    try:
+        return _execute_signal_only_backtest(
+            config,
+            routes,
+            data_routes,
+            candles,
+            warmup_candles,
+            hyperparameters,
+            progress_callback,
+        )
+    finally:
+        _reset_research_runtime_state()
+
+
+def _execute_signal_only_backtest(
+    config: dict,
+    routes: List[Dict[str, str]],
+    data_routes: List[Dict[str, str]],
+    candles: dict,
+    warmup_candles: Optional[dict],
+    hyperparameters: Optional[dict],
+    progress_callback,
+) -> tuple:
+    """Execute a signal-only run inside an initialized research runtime."""
     jesse_config['app']['trading_mode'] = 'backtest'
     set_config(_format_config(config))
 
@@ -173,12 +202,6 @@ def run_signal_only_backtest(
         # NOTE: order_service.update_active_orders() and
         #       execute_simulated_market_orders() are intentionally omitted —
         #       no orders are ever submitted, so there is nothing to process.
-
-    # ------------------------------------------------------------------
-    # Cleanup – same as _isolated_backtest()
-    # ------------------------------------------------------------------
-    reset_config()
-    store.reset()
 
     return (
         np.array(bar_timestamps, dtype=np.int64),
