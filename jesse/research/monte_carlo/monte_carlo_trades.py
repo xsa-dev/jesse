@@ -37,6 +37,7 @@ class EquityCurveSeries(TypedDict):
     data: List[EquityCurvePoint]
 
 class MonteCarloTradeScenarioResult(TypedDict, total=False):
+    scenario_index: int
     # Metrics reconstructed from shuffled trades
     total_return: float
     final_value: float
@@ -112,6 +113,7 @@ def _ray_run_scenario_monte_carlo(
             shuffled_trades, original_equity_curve, starting_balance
         )
         result = _calculate_metrics_from_equity_curve(equity_curve, starting_balance)
+        result['scenario_index'] = scenario_index
         result['trades'] = shuffled_trades
         result['equity_curve'] = equity_curve
         return {'result': result, 'log': None, 'error': False}
@@ -192,6 +194,9 @@ def _run_monte_carlo_simulation(
             num_scenarios, trades_ref, equity_curve_ref, starting_balance
         )
         results = _process_scenario_results(scenario_refs, pbar, progress_callback, result_callback)
+        # Ray returns completed tasks in execution order. Public results use
+        # scenario order so a seeded run has one deterministic representation.
+        results.sort(key=lambda scenario: scenario['scenario_index'])
         if pbar:
             pbar.close()
         print(f"Completed {len(results)} Monte Carlo scenarios out of {num_scenarios} requested")
@@ -264,11 +269,11 @@ def _launch_monte_carlo_scenarios(
     scenario_refs: List[Any] = []
     for i in range(num_scenarios):
         ref = _ray_run_scenario_monte_carlo.remote(
-            original_trades=trades_ref,
-            original_equity_curve=equity_curve_ref,
-            starting_balance=starting_balance,
-            scenario_index=i,
-            seed=BASE_RANDOM_SEED
+            trades_ref,
+            equity_curve_ref,
+            starting_balance,
+            i,
+            BASE_RANDOM_SEED,
         )
         scenario_refs.append(ref)
     return scenario_refs
@@ -579,5 +584,3 @@ def plot_monte_carlo_trades_chart(results: dict, charts_folder: str = None) -> N
     chart_path = os.path.join(charts_folder, filename)
     plt.savefig(chart_path, dpi=150, bbox_inches='tight'); plt.close()
     print(f"   💾 Trades chart saved: {chart_path}")
-
-
