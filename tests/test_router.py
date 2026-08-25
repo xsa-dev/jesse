@@ -2,6 +2,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import jesse.helpers as jh
 from jesse import exceptions
 from jesse.config import config, reset_config
 from jesse.enums import exchanges, timeframes
@@ -214,3 +215,21 @@ def test_reset_config_restores_nested_defaults_without_replacing_the_object() ->
     assert config['env']['data']['warmup_candles_num'] == 240
     assert config['env']['exchanges'][exchanges.SANDBOX]['balance'] == 10_000
     assert config['app']['considering_symbols'] == []
+
+
+def test_reset_config_clears_values_cached_from_the_previous_mode() -> None:
+    config['app']['trading_mode'] = 'papertrade'
+    # Pytest reads config fresh, so seed the cache state used by normal runtime
+    # processes directly.
+    jh.CACHED_CONFIG['env.data.warmup_candles_num'] = 999
+
+    assert jh.app_mode() == 'papertrade'
+    assert jh.is_live() is True
+    assert jh.is_paper_trading() is True
+
+    reset_config()
+
+    assert jh.CACHED_CONFIG == {}
+    assert jh.app_mode() == ''
+    assert jh.is_live() is False
+    assert jh.is_paper_trading() is False

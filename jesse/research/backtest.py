@@ -1,5 +1,6 @@
 from typing import List, Dict
 import os
+import sys
 import uuid
 import numpy as np
 from jesse.services import candle_service, exchange_service, order_service, position_service
@@ -136,6 +137,19 @@ def backtest(
     )
 
 
+def _reset_research_runtime_state() -> None:
+    """Restore every process-wide service owned by a research run."""
+    reset_config()
+    router._reset()
+    store.reset()
+
+    # Avoid constructing the API singleton while no routes are configured. If
+    # it already exists, its sandbox drivers belong to the completed session.
+    api_module = sys.modules.get('jesse.services.api')
+    if api_module is not None:
+        api_module.api.reset_drivers()
+
+
 def _isolated_backtest(
         config: dict,
         routes: List[Dict[str, str]],
@@ -159,6 +173,51 @@ def _isolated_backtest(
     # before configuration, routes, or stores are mutated guarantees that fast
     # and step simulation reject malformed input identically without leaked state.
     _validate_contiguous_one_minute_candles(candles)
+
+    _reset_research_runtime_state()
+    try:
+        return _execute_isolated_backtest(
+            config,
+            routes,
+            data_routes,
+            candles,
+            warmup_candles,
+            run_silently=run_silently,
+            hyperparameters=hyperparameters,
+            generate_csv=generate_csv,
+            generate_json=generate_json,
+            generate_equity_curve=generate_equity_curve,
+            benchmark=benchmark,
+            generate_hyperparameters=generate_hyperparameters,
+            generate_logs=generate_logs,
+            fast_mode=fast_mode,
+            candles_pipeline_class=candles_pipeline_class,
+            candles_pipeline_kwargs=candles_pipeline_kwargs,
+            generate_charts=generate_charts,
+        )
+    finally:
+        _reset_research_runtime_state()
+
+
+def _execute_isolated_backtest(
+        config: dict,
+        routes: List[Dict[str, str]],
+        data_routes: List[Dict[str, str]],
+        candles: dict,
+        warmup_candles: dict = None,
+        run_silently: bool = True,
+        hyperparameters: dict = None,
+        generate_csv: bool = False,
+        generate_json: bool = False,
+        generate_equity_curve: bool = False,
+        benchmark: bool = False,
+        generate_hyperparameters: bool = False,
+        generate_logs: bool = False,
+        fast_mode: bool = False,
+        candles_pipeline_class = None,
+        candles_pipeline_kwargs: dict = None,
+        generate_charts: bool = False,
+) -> dict:
 
     jesse_config['app']['trading_mode'] = 'backtest'
 
@@ -254,10 +313,6 @@ def _isolated_backtest(
     # Always include trades if available (needed for trade-shuffling Monte Carlo)
     if 'trades' in backtest_result:
         result['trades'] = backtest_result['trades']
-
-    # reset store and config so rerunning would be flawlessly possible
-    reset_config()
-    store.reset()
 
     return result
 

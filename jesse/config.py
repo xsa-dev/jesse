@@ -177,6 +177,7 @@ def reset_config() -> None:
     # identity while replacing every nested runtime mutation.
     config.clear()
     config.update(deepcopy(backup_config))
+    jh.clear_config_caches()
 
 
 backup_config = deepcopy(config)

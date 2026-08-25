@@ -172,12 +172,14 @@ def log_optimize_mode(message, session_id: str):
             jh.dump('error')
             print(f"Warning: Failed to write to optimize mode log file {log_file}: {e}")
 
-    # also, publish to redis
-    sync_publish('log', {
-        'id': jh.generate_unique_id(),
-        'timestamp': jh.now_to_timestamp(),
-        'message': message
-    })
+    # The research API has no dashboard session or Redis consumer. Dashboard
+    # optimizations keep publishing progress under their real session ID.
+    if session_id != 'research':
+        sync_publish('log', {
+            'id': jh.generate_unique_id(),
+            'timestamp': jh.now_to_timestamp(),
+            'message': message
+        })
 
 
 def log_monte_carlo(message, session_id: str):

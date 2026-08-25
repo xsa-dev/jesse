@@ -16,14 +16,17 @@ def _formatted_inputs_for_isolated_backtest(user_config, routes):
         'futures_leverage': user_config['exchange']['futures_leverage'],
         'futures_leverage_mode': user_config['exchange']['futures_leverage_mode'],
         'exchange': routes[0]['exchange'],
-        'warm_up_candles': jh.get_config('env.data.warmup_candles_num')
+        # Research and dashboard coordinators pass their selected warmup value
+        # because Ray workers do not share the coordinator's config dictionary.
+        'warm_up_candles': user_config['warm_up_candles'],
     }
 
 
 def get_fitness(
         user_config: dict, routes: list, data_routes: list, strategy_hp, hp: dict,
         training_warmup_candles: dict, training_candles: dict,
-        testing_warmup_candles: dict, testing_candles: dict, optimal_total: int, fast_mode: bool, session_id
+        testing_warmup_candles: dict, testing_candles: dict, optimal_total: int,
+        fast_mode: bool, session_id, objective_function: str,
 ) -> tuple:
     """
     Evaluates the fitness (i.e. backtest performance) of the strategy
@@ -46,7 +49,7 @@ def get_fitness(
         if training_metrics['total'] > 5:
             total_effect_rate = log10(training_metrics['total']) / log10(optimal_total)
             total_effect_rate = min(total_effect_rate, 1)
-            objective_function_config = jh.get_config('env.optimization.objective_function', 'sharpe')
+            objective_function_config = objective_function.lower()
             
             # Get the ratio based on objective function
             if objective_function_config == 'sharpe':

@@ -16,12 +16,16 @@ class API:
     def initiate_drivers(self) -> None:
         considering_exchanges = jh.get_config('app.considering_exchanges')
 
-        # A helpful assertion
+        # Driver construction requires the active route set.
         if not len(considering_exchanges):
             raise Exception('No exchange is available for initiating in the API class')
 
         for exchange_name in considering_exchanges:
             self.initiate_driver(exchange_name)
+
+    def reset_drivers(self) -> None:
+        """Discard driver instances owned by the completed runtime session."""
+        self.drivers.clear()
 
     def initiate_driver(self, exchange_name: str) -> None:
         """Idempotently register the API driver for one exchange."""

@@ -34,7 +34,8 @@ def ray_evaluate_trial(
     optimal_total,
     fast_mode,
     trial_number,
-    session_id
+    session_id,
+    objective_function,
 ):
     """Ray remote function to evaluate a trial.
 
@@ -55,7 +56,8 @@ def ray_evaluate_trial(
             testing_candles,
             optimal_total,
             fast_mode,
-            session_id
+            session_id,
+            objective_function,
         )
 
         # Log the trial details if debugging is enabled
@@ -122,6 +124,9 @@ class Optimizer:
         self.testing_warmup_candles = testing_warmup_candles
         self.testing_candles = testing_candles
         self.user_config = user_config
+        # Ray workers do not inherit the coordinator's in-memory config, so
+        # every trial receives the selected objective as an explicit input.
+        self.objective_function = jh.get_config('env.optimization.objective_function', 'sharpe').lower()
 
         # Validate and set the number of CPU cores to use
         if cpu_cores < 1:
@@ -514,7 +519,8 @@ class Optimizer:
                         self.optimal_total,
                         self.fast_mode,
                         self.trial_counter,
-                        self.session_id
+                        self.session_id,
+                        self.objective_function,
                     )
 
                     # Store the reference

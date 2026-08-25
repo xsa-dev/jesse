@@ -6,6 +6,103 @@ from jesse.strategies import Strategy
 from jesse import research
 
 
+class _IsolationTradeStrategy(Strategy):
+    def should_long(self) -> bool:
+        return self.index == 0
+
+    def go_long(self) -> None:
+        self.buy = 1, self.price
+
+    def should_cancel_entry(self) -> bool:
+        return False
+
+    def on_open_position(self, order) -> None:
+        self.take_profit = self.position.qty, self.price + 2
+
+
+class _IsolationFailureStrategy(Strategy):
+    def before(self) -> None:
+        raise RuntimeError('intentional strategy failure')
+
+    def should_long(self) -> bool:
+        return False
+
+    def go_long(self) -> None:
+        pass
+
+    def should_cancel_entry(self) -> bool:
+        return False
+
+
+def _isolation_inputs(exchange: str, exchange_type: str, strategy: type[Strategy]) -> tuple[dict, list, dict]:
+    symbol = 'TEST-USDT'
+    config = {
+        'starting_balance': 10_000,
+        'fee': 0.001,
+        'type': exchange_type,
+        'exchange': exchange,
+        'warm_up_candles': 0,
+    }
+    if exchange_type == 'futures':
+        config.update({
+            'futures_leverage': 2,
+            'futures_leverage_mode': 'cross',
+        })
+
+    routes = [{
+        'exchange': exchange,
+        'strategy': strategy,
+        'symbol': symbol,
+        'timeframe': '1m',
+    }]
+    candles = {
+        jh.key(exchange, symbol): {
+            'exchange': exchange,
+            'symbol': symbol,
+            'candles': candles_from_close_prices(range(10, 31)),
+        },
+    }
+    return config, routes, candles
+
+
+def _isolation_fingerprint(exchange: str, exchange_type: str) -> dict:
+    config, routes, candles = _isolation_inputs(exchange, exchange_type, _IsolationTradeStrategy)
+    result = research.backtest(config, routes, [], candles)
+    trade = result['trades'][0]
+    metrics = result['metrics']
+
+    def normalized(value):
+        return round(value, 8) if isinstance(value, float) else value
+
+    return {
+        'metrics': {
+            key: normalized(metrics[key])
+            for key in ('total', 'finishing_balance', 'net_profit', 'fee')
+        },
+        'trade': {
+            key: normalized(trade[key])
+            for key in ('type', 'entry_price', 'exit_price', 'qty', 'fee', 'PNL', 'opened_at', 'closed_at')
+        },
+    }
+
+
+def _assert_isolated_runtime_is_clean() -> None:
+    from jesse.config import config
+    from jesse.routes import router
+    from jesse.services.api import api
+    from jesse.store import store
+
+    assert config['app']['trading_mode'] == ''
+    assert router.routes == []
+    assert router.data_routes == []
+    assert api.drivers == {}
+    assert store.vars == {}
+    assert store.exchanges.storage == {}
+    assert store.orders.storage == {}
+    assert jh.is_live() is False
+    assert jh.is_optimizing() is False
+
+
 def test_can_pass_strategy_as_string_in_futures_exchange():
     fake_candles = candles_from_close_prices([101, 102, 103, 104, 105, 106, 107, 108, 109, 110])
     exchange_name = 'Fake Exchange'
@@ -359,3 +456,46 @@ def test_passed_candles_are_not_affected_by_running_isolated_backtests():
     research.backtest(config, routes, data_routes, candles)
 
     assert len(candles['Fake Exchange-FAKE-USDT']['candles']) == 10
+
+
+def test_representative_backtests_are_independent_of_run_order():
+    # Process-wide drivers and configuration must not make a research result
+    # depend on which exchange ran immediately before it.
+    futures_first = _isolation_fingerprint('Isolation Futures', 'futures')
+    spot_second = _isolation_fingerprint('Isolation Spot', 'spot')
+
+    spot_first = _isolation_fingerprint('Isolation Spot', 'spot')
+    futures_second = _isolation_fingerprint('Isolation Futures', 'futures')
+
+    assert futures_first['metrics']['total'] == 1
+    assert spot_first['metrics']['total'] == 1
+    assert futures_first == futures_second
+    assert spot_first == spot_second
+
+
+def test_research_backtest_cleans_runtime_state_after_success():
+    from jesse.config import config
+    from jesse.store import store
+
+    # Prime mode caches and shared strategy variables with values that cannot
+    # belong to the research session.
+    config['app']['trading_mode'] = 'papertrade'
+    store.vars['outside-session'] = True
+    assert jh.is_live() is True
+
+    _isolation_fingerprint('Cleanup Exchange', 'futures')
+
+    _assert_isolated_runtime_is_clean()
+
+
+def test_research_backtest_cleans_runtime_state_after_strategy_failure():
+    config, routes, candles = _isolation_inputs(
+        'Failing Exchange',
+        'futures',
+        _IsolationFailureStrategy,
+    )
+
+    with pytest.raises(RuntimeError, match='intentional strategy failure'):
+        research.backtest(config, routes, [], candles)
+
+    _assert_isolated_runtime_is_clean()
