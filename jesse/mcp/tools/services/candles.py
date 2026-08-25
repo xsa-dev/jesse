@@ -68,7 +68,7 @@ def import_candles_service(
                 "exchange": exchange,
                 "symbol": symbol,
                 "start_date": start_date,
-                "message": f"Candle import started for {symbol} on {exchange}. Poll get_existing_candles() to confirm completion, or cancel_candle_import(import_id) to stop it."
+                "message": f"Candle import started for {symbol} on {exchange}. Poll get_candle_import_status(import_id) until it reaches a terminal state."
             }
         else:
             return {
@@ -295,7 +295,7 @@ def get_candle_import_status_service(import_id: str) -> dict:
         import_id: The import process ID returned by import_candles()
 
     Returns:
-        {"status": "running"|"finished", "import_id": "...", ...}
+        {"status": "running"|"finished"|"failed"|"cancelled", "import_id": "...", ...}
     """
     api_url = mcp_config.JESSE_API_URL
     password = mcp_config.JESSE_PASSWORD
@@ -317,6 +317,11 @@ def get_candle_import_status_service(import_id: str) -> dict:
                 "import_id": import_id,
                 "message": f"Import {import_id} is {data.get('status')}."
             }
+            if data.get('error') is not None:
+                result['error'] = data['error']
+                result['message'] = f"Import {import_id} failed: {data['error']}"
+            if data.get('traceback') is not None:
+                result['traceback'] = data['traceback']
             # Surface live progress (percent complete, ETA, date reached so far) while
             # the import runs, so the caller sees it advancing instead of a blind "running".
             progress = data.get("progress")

@@ -22,12 +22,16 @@ from jesse.services import logger
 from jesse.services.failure import register_custom_exception_handler
 from jesse.services.redis import sync_publish, is_process_active
 from jesse.services import order_service
-from timeloop import Timeloop
-from datetime import timedelta
 from jesse.services.progressbar import Progressbar
 from jesse.constants import TIMEFRAME_TO_ONE_MINUTES
 from jesse.services import candle_service, order_service, position_service, exchange_service
 from jesse_rust import candle_from_one_minutes as candle_from_one_minutes_rust
+
+
+def _raise_if_cancelled(client_id: str) -> None:
+    """Stop from the active backtest path when its process marker is removed."""
+    if not jh.is_unit_testing() and not is_process_active(client_id):
+        raise exceptions.Termination
 
 
 def run(
@@ -47,17 +51,6 @@ def run(
         benchmark: bool = False,
         theme: str = 'light'
 ) -> None:
-    if not jh.is_unit_testing():
-        # at every second, we check to see if it's time to execute stuff
-        status_checker = Timeloop()
-
-        @status_checker.job(interval=timedelta(seconds=1))
-        def handle_time():
-            if is_process_active(client_id) is False:
-                raise exceptions.Termination
-
-        status_checker.start()
-
     from jesse.config import config
     config['app']['trading_mode'] = 'backtest'
 
@@ -65,6 +58,7 @@ def run(
     config['app']['debug_mode'] = debug_mode
 
     register_custom_exception_handler()
+    _raise_if_cancelled(client_id)
 
     _execute_backtest(
         client_id, debug_mode, user_config, exchange, routes, data_routes, start_date, finish_date, candles, chart,
@@ -143,6 +137,8 @@ def _execute_backtest(
         except exceptions.CandleNotFoundInDatabase as e:
             _handle_sync_no_candles(e, start_date, exchange, client_id=client_id, finish_date=finish_date)
 
+    _raise_if_cancelled(client_id)
+
     if not jh.should_execute_silently():
         sync_publish('general_info', {
             'session_id': jh.get_session_id(),
@@ -193,16 +189,23 @@ def _execute_backtest(
             return
         else:
             raise e
+    except exceptions.Termination:
+        raise
     except Exception as e:
         # Store exception in database (only for UI dashboard)
         if not jh.should_execute_silently():
             import traceback
             from jesse.models.BacktestSession import store_backtest_session_exception, update_backtest_session_status
-            store_backtest_session_exception(client_id, str(e), traceback.format_exc())
+            store_backtest_session_exception(
+                client_id,
+                f'{type(e).__name__}: {e}',
+                traceback.format_exc(),
+            )
             update_backtest_session_status(client_id, 'stopped')
         raise
 
     if result and not jh.should_execute_silently():
+        _raise_if_cancelled(client_id)
         sync_publish('alert', {
             'message': f"Successfully executed backtest simulation in: {result['execution_duration']} seconds",
             'type': 'success'
@@ -254,6 +257,7 @@ def _execute_backtest(
         
         # Update backtest session in database with results
         from jesse.models.BacktestSession import update_backtest_session_results, update_backtest_session_status
+        _raise_if_cancelled(client_id)
         update_backtest_session_results(
             id=client_id,
             metrics=result.get('metrics'),
@@ -309,10 +313,8 @@ def _handle_sync_no_candles(e, start_date, exchange, client_id=None, finish_date
             },
         )
 
-        # Persist a terminal error on the session so MCP/dashboard callers stop polling
-        # a session that would otherwise stay "running" forever. Previously the
-        # candle-shortage path raised without ever marking the session stopped, which
-        # surfaced to API clients as a silent hang.
+        # Persist a terminal error so polling clients never mistake this failed run
+        # for active work.
         if client_id is not None and not jh.should_execute_silently():
             from jesse.models.BacktestSession import (
                 store_backtest_session_exception,
@@ -853,6 +855,9 @@ def get_candles_from_pipeline(candles_pipeline: Optional[BaseCandlesPipeline], c
 def _update_progress_bar(
         progressbar: Progressbar, run_silently: bool, candle_index: int, candle_step: int, last_update_time: float
 ) -> float:
+    if not run_silently:
+        _raise_if_cancelled(jh.get_session_id())
+
     throttle_interval = 0.5
     current_time = time.time()
     if not run_silently and candle_index % candle_step == 0:

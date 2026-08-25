@@ -1,12 +1,10 @@
 import json
 import math
 import time
-from datetime import timedelta
 from typing import Dict, List, Any, Union
 
 import arrow
 import pydash
-from timeloop import Timeloop
 
 import jesse.helpers as jh
 from jesse.exceptions import CandleNotFoundInExchange
@@ -31,12 +29,84 @@ def candle_import_progress_key(client_id: str) -> str:
     return f"{ENV_VALUES.get('APP_PORT', '9000')}|candle-import-progress|{client_id}"
 
 
+def candle_import_outcome_key(client_id: str) -> str:
+    return f"{ENV_VALUES.get('APP_PORT', '9000')}|candle-import-outcome|{client_id}"
+
+
+def store_import_outcome(
+    client_id: str,
+    status: str,
+    error: str = None,
+    error_traceback: str = None,
+) -> None:
+    """Persist a terminal import outcome so polling clients receive the real result."""
+    payload = {'status': status}
+    if error is not None:
+        payload['error'] = error
+    if error_traceback is not None:
+        payload['traceback'] = error_traceback
+
+    try:
+        sync_redis.set(
+            candle_import_outcome_key(client_id),
+            json.dumps(payload),
+            # Keep terminal details available for delayed MCP polling while
+            # ensuring abandoned import IDs expire without manual cleanup.
+            ex=86400,
+        )
+    except Exception:
+        pass
+
+
+def get_import_outcome(client_id: str) -> dict:
+    """Return the persisted terminal outcome, or an empty mapping when unavailable."""
+    try:
+        raw = sync_redis.get(candle_import_outcome_key(client_id))
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def validate_import_request(exchange: str, symbol: str, start_date_str: str) -> tuple[int, str]:
+    """Validate values that can be rejected before an import worker is started."""
+    if exchange not in drivers:
+        raise ValueError(
+            f'{exchange} is not a supported exchange. Supported exchanges are: {driver_names}'
+        )
+
+    try:
+        start_timestamp = jh.arrow_to_timestamp(arrow.get(start_date_str, 'YYYY-MM-DD'))
+    except Exception:
+        raise ValueError(
+            'start_date must be a string representing a date before today. '
+            f'ex: 2020-01-17. You entered: {start_date_str}'
+        )
+
+    today = arrow.utcnow().floor('day').int_timestamp * 1000
+    if start_timestamp == today:
+        raise ValueError("Today's date is not accepted. start_date must represent a date BEFORE today.")
+    if start_timestamp > today:
+        raise ValueError("Future's date is not accepted. start_date must represent a date BEFORE today.")
+
+    # quote_asset() enforces Jesse's BASE-QUOTE symbol contract.
+    try:
+        jh.quote_asset(symbol)
+    except exceptions.InvalidRoutes as e:
+        raise ValueError(str(e)) from None
+    return start_timestamp, symbol.upper()
+
+
+def _raise_if_cancelled(client_id: str, running_via_dashboard: bool) -> None:
+    """Stop from the active import path when the API removes its process marker."""
+    if running_via_dashboard and not is_process_active(client_id):
+        raise exceptions.Termination
+
+
 def _print_import_progressbar(exchange: str, symbol: str, percent: float, remaining_seconds: float,
                               reached_date: str) -> None:
     """
-    Render a compact, visual progress bar for CLI / research imports (the
-    `show_progressbar=True` path). Replaces the bare "Progress: X% - N seconds"
-    line with a filled bar, a human-readable ETA, and the date reached so far.
+    Render a compact progress bar for CLI and research imports, including a
+    human-readable ETA and the latest date reached.
     """
     width = 32
     filled = max(0, min(width, int(round(width * percent / 100))))
@@ -85,53 +155,69 @@ def run(
         running_via_dashboard: bool = True,
         show_progressbar: bool = False,
 ):
+    """Run an import and retain its terminal state for API and MCP polling."""
+    if running_via_dashboard:
+        store_import_outcome(client_id, 'running')
+
+    try:
+        result = _run(
+            client_id,
+            exchange,
+            symbol,
+            start_date_str,
+            mode,
+            running_via_dashboard,
+            show_progressbar,
+        )
+    except exceptions.Termination:
+        if running_via_dashboard:
+            store_import_outcome(client_id, 'cancelled')
+        raise
+    except Exception as e:
+        if running_via_dashboard:
+            import traceback
+
+            store_import_outcome(
+                client_id,
+                'failed',
+                f'{type(e).__name__}: {e}',
+                traceback.format_exc(),
+            )
+        raise
+    else:
+        if running_via_dashboard:
+            store_import_outcome(client_id, 'finished')
+        return result
+
+
+def _run(
+        client_id: str,
+        exchange: str,
+        symbol: str,
+        start_date_str: str,
+        mode: str = 'candles',
+        running_via_dashboard: bool = True,
+        show_progressbar: bool = False,
+):
+    start_timestamp, symbol = validate_import_request(exchange, symbol, start_date_str)
+
     if running_via_dashboard:
         config['app']['trading_mode'] = mode
         register_custom_exception_handler()
         store.app.set_session_id(client_id)
 
+    _raise_if_cancelled(client_id, running_via_dashboard)
+
     # open database connection
     from jesse.services.db import database
     database.open_connection()
-
-    if running_via_dashboard:
-        # at every second, we check to see if it's time to execute stuff
-        status_checker = Timeloop()
-
-        @status_checker.job(interval=timedelta(seconds=1))
-        def handle_time():
-            if is_process_active(client_id) is False:
-                raise exceptions.Termination
-
-        status_checker.start()
-
-    try:
-        start_timestamp = jh.arrow_to_timestamp(arrow.get(start_date_str, 'YYYY-MM-DD'))
-    except:
-        raise ValueError(
-            f'start_date must be a string representing a date before today. ex: 2020-01-17. You entered: {start_date_str}')
-
-    # more start_date validations
-    today = arrow.utcnow().floor('day').int_timestamp * 1000
-    if start_timestamp == today:
-        raise ValueError("Today's date is not accepted. start_date must be a string a representing date BEFORE today.")
-    elif start_timestamp > today:
-        raise ValueError("Future's date is not accepted. start_date must be a string a representing date BEFORE today.")
-
-    # We just call this to throw a exception in case of a symbol without dash
-    jh.quote_asset(symbol)
-
-    symbol = symbol.upper()
 
     until_date = arrow.utcnow().floor('day')
     start_date = arrow.get(start_timestamp / 1000)
     days_count = jh.date_diff_in_days(start_date, until_date)
     candles_count = days_count * 1440
 
-    try:
-        driver: CandleExchange = drivers[exchange]()
-    except KeyError:
-        raise ValueError(f'{exchange} is not a supported exchange. Supported exchanges are: {driver_names}')
+    driver: CandleExchange = drivers[exchange]()
 
     loop_length = int(candles_count / driver.count) + 1
 
@@ -142,6 +228,7 @@ def run(
     imported_minutes = 0
     
     for i in range(candles_count):
+        _raise_if_cancelled(client_id, running_via_dashboard)
         temp_start_timestamp = start_date.int_timestamp * 1000
         temp_end_timestamp = temp_start_timestamp + (driver.count - 1) * 60000
 
@@ -168,6 +255,7 @@ def run(
 
             # fetch from market
             candles = driver.fetch(symbol, temp_start_timestamp, timeframe='1m')
+            _raise_if_cancelled(client_id, running_via_dashboard)
 
             # check if candles have been returned and check those returned start with the right timestamp.
             # Sometimes exchanges just return the earliest possible candles if the start date doesn't exist.
@@ -202,8 +290,8 @@ def run(
                         })
                     else:
                         print(msg)
-                    run(client_id, exchange, symbol, jh.timestamp_to_time(first_existing_timestamp)[:10], mode,
-                        running_via_dashboard, show_progressbar)
+                    _run(client_id, exchange, symbol, jh.timestamp_to_time(first_existing_timestamp)[:10], mode,
+                         running_via_dashboard, show_progressbar)
                     return
 
             # fill absent candles (if there's any)
@@ -269,10 +357,9 @@ def run(
         f'({imported_days} days imported, {skipped_days} days already existed in the database). '
     )
 
-    # stop the status_checker time loop
-    if running_via_dashboard:
-        status_checker.stop()
+    _raise_if_cancelled(client_id, running_via_dashboard)
 
+    if running_via_dashboard:
         sync_publish('alert', {
             'message': success_text,
             'type': 'success'

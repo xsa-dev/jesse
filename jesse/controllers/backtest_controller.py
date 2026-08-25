@@ -14,6 +14,7 @@ from jesse.models.BacktestSession import (
     delete_backtest_session,
     get_backtest_session_by_id as get_backtest_session_by_id_from_db,
     update_backtest_session_status,
+    store_backtest_session_exception,
     purge_backtest_sessions
 )
 from jesse.services.transformers import get_backtest_session, get_backtest_session_for_load_more
@@ -32,30 +33,43 @@ def backtest(request_json: BacktestRequestJson):
     Start a backtest process
     """
 
-    jh.validate_cwd()
+    try:
+        jh.validate_cwd()
 
-    # Persist the exact configuration accepted for this run before the worker can
-    # update the same session with progress and results.
-    update_backtest_session_state(request_json.id, request_json.state)
+        # The upsert makes the accepted request visible before the worker can
+        # publish progress or results for the same session.
+        update_backtest_session_state(request_json.id, request_json.state)
+        update_backtest_session_status(request_json.id, 'running')
 
-    process_manager.add_task(
-        run_backtest,
-        request_json.id,
-        request_json.debug_mode,
-        request_json.config,
-        request_json.exchange,
-        request_json.routes,
-        request_json.data_routes,
-        request_json.start_date,
-        request_json.finish_date,
-        None,
-        request_json.export_chart,
-        request_json.export_csv,
-        request_json.export_json,
-        request_json.fast_mode,
-        request_json.benchmark,
-        request_json.theme
-    )
+        process_manager.add_task(
+            run_backtest,
+            request_json.id,
+            request_json.debug_mode,
+            request_json.config,
+            request_json.exchange,
+            request_json.routes,
+            request_json.data_routes,
+            request_json.start_date,
+            request_json.finish_date,
+            None,
+            request_json.export_chart,
+            request_json.export_csv,
+            request_json.export_json,
+            request_json.fast_mode,
+            request_json.benchmark,
+            request_json.theme,
+        )
+    except Exception as e:
+        import traceback
+
+        error = f'{type(e).__name__}: {e}'
+        error_traceback = traceback.format_exc()
+        try:
+            store_backtest_session_exception(request_json.id, error, error_traceback)
+            update_backtest_session_status(request_json.id, 'stopped')
+        except Exception:
+            pass
+        return JSONResponse({'error': error, 'traceback': error_traceback}, status_code=500)
 
     return JSONResponse({'message': 'Started backtesting...'}, status_code=202)
 

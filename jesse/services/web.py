@@ -1,9 +1,10 @@
 from typing import List, Dict, Optional
+from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 fastapi_app = FastAPI()
@@ -38,6 +39,19 @@ class BacktestRequestJson(BaseModel):
     benchmark: bool
     theme: str = 'light'
     state: dict
+
+    @model_validator(mode='after')
+    def validate_date_range(self):
+        """Reject malformed or reversed ranges before a worker is queued."""
+        try:
+            start = datetime.strptime(self.start_date, '%Y-%m-%d')
+            finish = datetime.strptime(self.finish_date, '%Y-%m-%d')
+        except ValueError:
+            raise ValueError('start_date and finish_date must use the YYYY-MM-DD format')
+
+        if start >= finish:
+            raise ValueError('start_date must be earlier than finish_date')
+        return self
 
 
 class OptimizationRequestJson(BaseModel):

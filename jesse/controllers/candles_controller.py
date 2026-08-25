@@ -15,18 +15,38 @@ def import_candles(request_json: ImportCandlesRequestJson) -> JSONResponse:
     """
     Import candles for a specific exchange and symbol
     """
-    jh.validate_cwd()
-
-
     from jesse.modes import import_candles_mode
 
-    process_manager.add_task(
-        import_candles_mode.run, 
-        request_json.id, 
-        request_json.exchange, 
-        request_json.symbol,
-        request_json.start_date
-    )
+    try:
+        jh.validate_cwd()
+        import_candles_mode.validate_import_request(
+            request_json.exchange,
+            request_json.symbol,
+            request_json.start_date,
+        )
+        import_candles_mode.store_import_outcome(request_json.id, 'running')
+        process_manager.add_task(
+            import_candles_mode.run,
+            request_json.id,
+            request_json.exchange,
+            request_json.symbol,
+            request_json.start_date,
+        )
+    except ValueError as e:
+        error = f'{type(e).__name__}: {e}'
+        import_candles_mode.store_import_outcome(request_json.id, 'failed', error)
+        return JSONResponse({'error': error}, status_code=422)
+    except Exception as e:
+        import traceback
+
+        error = f'{type(e).__name__}: {e}'
+        import_candles_mode.store_import_outcome(
+            request_json.id,
+            'failed',
+            error,
+            traceback.format_exc(),
+        )
+        return JSONResponse({'error': error}, status_code=500)
 
     return JSONResponse({'message': 'Started importing candles...'}, status_code=202)
 
@@ -38,6 +58,8 @@ def cancel_import_candles(request_json: CancelRequestJson):
     """
 
     process_manager.cancel_process(request_json.id)
+    from jesse.modes.import_candles_mode import store_import_outcome
+    store_import_outcome(request_json.id, 'cancelled')
 
     return JSONResponse({'message': f'Candles process with ID of {request_json.id} was requested for termination'},
                         status_code=202)
@@ -79,23 +101,34 @@ def get_candles(json_request: GetCandlesRequestJson) -> JSONResponse:
 @router.post("/import-status")
 def get_candle_import_status(request_json: CancelRequestJson) -> JSONResponse:
     """
-    Check whether a candle import process is still running. Used in MCP to check whether a previous import process is still running.
+    Return active progress or the persisted terminal outcome for an import.
 
-    Uses a single Redis SISMEMBER call — no database queries.
+    The endpoint uses Redis only and never queries the candle database.
     """
 
-    running = bool(is_process_active(request_json.id))
+    from jesse.modes.import_candles_mode import (
+        candle_import_progress_key,
+        get_import_outcome,
+    )
+
+    outcome = get_import_outcome(request_json.id)
+    terminal_status = outcome.get('status')
+    running = bool(is_process_active(request_json.id)) and terminal_status in {None, 'running'}
     response = {
         'import_id': request_json.id,
-        'status': 'running' if running else 'finished',
+        'status': 'running' if running else terminal_status or 'finished',
     }
+    if not running:
+        if outcome.get('error') is not None:
+            response['error'] = outcome['error']
+        if outcome.get('traceback') is not None:
+            response['traceback'] = outcome['traceback']
 
     # Attach live progress (percent complete, ETA, date reached so far) when the import
     # is still running so callers can see real movement instead of a blind "running".
     # When finished, clean up any lingering progress key.
     import json
     from jesse.services.redis import sync_redis
-    from jesse.modes.import_candles_mode import candle_import_progress_key
     progress_key = candle_import_progress_key(request_json.id)
     try:
         if running:

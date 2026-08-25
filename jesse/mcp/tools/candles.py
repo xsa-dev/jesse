@@ -54,7 +54,8 @@ def register_candles_tools(mcp):
         Starts the import for the given exchange/symbol and returns as soon as Jesse
         acknowledges the request. Does NOT wait for the import to finish.
         Poll get_candle_import_status(import_id) every few seconds until "finished",
-        then optionally verify with get_existing_candles(). Use cancel_candle_import(import_id) to stop it.
+        "failed", or "cancelled". After "finished", optionally verify with
+        get_existing_candles(). Use cancel_candle_import(import_id) to stop it.
 
         All supported timeframes are imported automatically: 1m, 3m, 5m, 15m, 30m,
         45m, 1h, 2h, 3h, 4h, 6h, 8h, 12h, 1D, 3D, 1W, 1M.
@@ -224,7 +225,7 @@ def register_candles_tools(mcp):
             >>> import time
             >>> while True:
             ...     status = get_candle_import_status(import_id)
-            ...     if status["status"] == "finished":
+            ...     if status["status"] in {"finished", "failed", "cancelled"}:
             ...         break
             ...     time.sleep(5)
         """
@@ -597,4 +598,3 @@ def register_candles_tools(mcp):
             >>> print(f"BTC datasets remaining: {len(btc_data)}")  # Should be 0
         """
         return delete_candles_service(exchange=exchange, symbol=symbol)
-

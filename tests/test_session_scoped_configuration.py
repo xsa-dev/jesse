@@ -105,6 +105,11 @@ def test_backtest_persists_the_accepted_form_before_starting_worker(monkeypatch)
         lambda session_id, saved_state: calls.append(('state', session_id, saved_state)),
     )
     monkeypatch.setattr(
+        backtest_controller,
+        'update_backtest_session_status',
+        lambda session_id, status: calls.append(('status', session_id, status)),
+    )
+    monkeypatch.setattr(
         backtest_controller.process_manager,
         'add_task',
         lambda *args: calls.append(('worker', args)),
@@ -114,7 +119,8 @@ def test_backtest_persists_the_accepted_form_before_starting_worker(monkeypatch)
 
     assert response.status_code == 202
     assert calls[0] == ('state', 'backtest-id', state)
-    assert calls[1][0] == 'worker'
+    assert calls[1] == ('status', 'backtest-id', 'running')
+    assert calls[2][0] == 'worker'
 
 
 def test_backtest_request_requires_session_state():

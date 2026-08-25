@@ -19,7 +19,7 @@ Correct flow:
 1. Run the backtest (see `jesse://backtest_management`).
 2. If — and only if — it fails with a missing-candle error, call
    `import_candles()` starting ~2 months before the user's `start_date`.
-3. Poll `get_candle_import_status(import_id)` until `"finished"`, then
+3. Poll `get_candle_import_status(import_id)` until `"finished"`, `"failed"`, or `"cancelled"`. After `"finished"`,
    retry the backtest.
 4. Use `get_existing_candles()` only for explicit user-driven inspection
    (e.g. "what data do I have?"), never as a pre-flight gate.
