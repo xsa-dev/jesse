@@ -111,6 +111,7 @@ def _run_metrics_backtest(
         strategy: type[Strategy],
         prices: np.ndarray,
         fee: float = 0.001,
+        annualization: int = 365,
 ) -> dict:
     """Run a deterministic futures session and return its public research result."""
     candles = candles_from_close_prices(prices.tolist())
@@ -118,6 +119,7 @@ def _run_metrics_backtest(
         'starting_balance': 10_000,
         'fee': fee,
         'type': 'futures',
+        'annualization': annualization,
         'futures_leverage': 1,
         'futures_leverage_mode': 'cross',
         'exchange': EXCHANGE,
@@ -334,13 +336,27 @@ def test_mixed_multi_day_backtest_metrics_contract() -> None:
     assert stats['total_open_trades'] == 0
     assert stats['open_pl'] == 0
     assert stats['max_drawdown'] == pytest.approx(-0.10200014186112494)
-    assert stats['max_underwater_period'] == 3
-    assert stats['annual_return'] == pytest.approx(4.07203781195884)
+    assert stats['max_underwater_period'] == 2
+    assert stats['annual_return'] == pytest.approx(5.465903612204692)
     assert stats['sharpe_ratio'] == pytest.approx(2.45661087496446)
     assert stats['sortino_ratio'] == pytest.approx(4.591544590351203)
-    assert stats['calmar_ratio'] == pytest.approx(39.921883809759734)
+    assert stats['calmar_ratio'] == pytest.approx(53.58721578688214)
     assert stats['omega_ratio'] == pytest.approx(1.4299197170055138)
     assert np.isnan(stats['serenity_index'])
+    assert len(store.app.daily_balance_timestamps) == len(store.app.daily_balance)
+    assert store.app.daily_balance_timestamps == sorted(store.app.daily_balance_timestamps)
+
+
+def test_stock_annualization_changes_ratios_without_changing_timestamp_based_growth() -> None:
+    crypto = _run_metrics_backtest(_MixedMetricsStrategy, _mixed_trade_prices(), annualization=365)['metrics']
+    stock = _run_metrics_backtest(_MixedMetricsStrategy, _mixed_trade_prices(), annualization=252)['metrics']
+
+    assert crypto['annualization'] == 365
+    assert stock['annualization'] == 252
+    assert stock['sharpe_ratio'] == pytest.approx(crypto['sharpe_ratio'] * np.sqrt(252 / 365))
+    assert stock['sortino_ratio'] == pytest.approx(crypto['sortino_ratio'] * np.sqrt(252 / 365))
+    assert stock['annual_return'] == pytest.approx(crypto['annual_return'])
+    assert stock['calmar_ratio'] == pytest.approx(crypto['calmar_ratio'])
 
 
 def test_no_trade_backtest_returns_zeroed_portfolio_metrics() -> None:
@@ -354,6 +370,7 @@ def test_no_trade_backtest_returns_zeroed_portfolio_metrics() -> None:
         'total': 0,
         'win_rate': 0,
         'net_profit_percentage': 0,
+        'annualization': 365,
     }
     assert result['trades'] == []
 

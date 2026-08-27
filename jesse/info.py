@@ -530,6 +530,14 @@ exchange_info = {
     },
 }
 
+# Existing exchange drivers are all crypto venues. Historical candle datasets
+# carry their own classifications and do not enter this live exchange registry.
+for _exchange in exchange_info.values():
+    _exchange['asset_class'] = 'crypto'
+    _exchange['instrument_type'] = 'perpetual' if _exchange['type'] == 'futures' else 'spot'
+    _exchange['simulation_model'] = 'perpetual_futures' if _exchange['type'] == 'futures' else 'spot'
+    _exchange['annualization'] = 365
+
 # list of supported exchanges for backtesting
 backtesting_exchanges = [k for k, v in exchange_info.items() if v['modes']['backtesting'] is True]
 backtesting_exchanges = list(sorted(backtesting_exchanges))

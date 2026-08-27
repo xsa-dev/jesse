@@ -6,6 +6,7 @@ import numpy as np
 from jesse.services import candle_service, exchange_service, order_service, position_service
 from jesse.services import charts
 from jesse.services.validators import validate_routes
+from jesse.services.simulation_assumptions import resolve_annualization
 from jesse.modes.backtest_mode import simulator
 from jesse.config import config as jesse_config, reset_config, set_config
 from jesse.routes import router
@@ -95,6 +96,8 @@ def backtest(
         'starting_balance': 5_000,
         'fee': 0.005,
         'type': 'futures',
+        'simulation_model': 'perpetual_futures',
+        'annualization': 365,
         'futures_leverage': 3,
         'futures_leverage_mode': 'cross',
         'exchange': 'Binance',
@@ -286,13 +289,19 @@ def _execute_isolated_backtest(
         backtest_result['charts_session_id'] = _session_id
         backtest_result['charts_folder'] = _charts_folder
 
+    empty_metrics = {
+        'total': 0,
+        'win_rate': 0,
+        'net_profit_percentage': 0,
+        'annualization': int(resolve_annualization(config)),
+    }
     result = {
-        'metrics': {'total': 0, 'win_rate': 0, 'net_profit_percentage': 0},
+        'metrics': empty_metrics,
         'logs': None,
     }
 
     if backtest_result['metrics'] is None:
-        result['metrics'] = {'total': 0, 'win_rate': 0, 'net_profit_percentage': 0}
+        result['metrics'] = empty_metrics
     else:
         result['metrics'] = backtest_result['metrics']
 
@@ -322,10 +331,19 @@ def _format_config(config):
     Jesse's required format for user_config is different from what this function accepts (so it
     would be easier to write for the researcher). Hence, we need to reformat the config_dict:
     """
+    from jesse.services.simulation_assumptions import (
+        legacy_type_from_simulation_model,
+        resolve_simulation_model,
+    )
+
+    simulation_model = resolve_simulation_model(config, config.get('type', 'futures'))
+    exchange_type = legacy_type_from_simulation_model(simulation_model)
     exchange_config = {
         'balance': config['starting_balance'],
         'fee': config['fee'],
-        'type': config['type'],
+        'type': exchange_type,
+        'simulation_model': simulation_model.value,
+        'annualization': int(resolve_annualization(config)),
         'name': config['exchange'],
     }
     # futures exchange has different config, so:

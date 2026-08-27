@@ -177,11 +177,15 @@ class MonteCarloRunner:
 
     def _publish_general_info(self):
         general_info = {
-            'started_at': jh.timestamp_to_arrow(self.start_time).humanize(),
+            'started_at': jh.timestamp_to_arrow(self.start_time).humanize(
+                jh.timestamp_to_arrow(jh.now(force_fresh=True))
+            ),
             'run_trades': self.run_trades,
             'run_candles': self.run_candles,
             'num_scenarios': self.num_scenarios,
             'exchange_type': self.user_config['exchange']['type'],
+            'simulation_model': self.user_config['exchange'].get('simulation_model'),
+            'annualization': self.user_config['exchange'].get('annualization', 365),
             'leverage_mode': self.user_config['exchange'].get('futures_leverage_mode', 'N/A'),
             'leverage': self.user_config['exchange'].get('futures_leverage', 'N/A'),
             'cpu_cores': self.cpu_cores,
@@ -207,6 +211,8 @@ class MonteCarloRunner:
             'starting_balance': self.user_config.get('starting_balance', 10000),
             'fee': self.user_config.get('fee', 0.0005),
             'type': self.user_config.get('exchange', {}).get('type', 'futures'),
+            'simulation_model': self.user_config.get('exchange', {}).get('simulation_model'),
+            'annualization': self.user_config.get('exchange', {}).get('annualization', 365),
             'futures_leverage': self.user_config.get('exchange', {}).get('futures_leverage', 1),
             'futures_leverage_mode': self.user_config.get('exchange', {}).get('futures_leverage_mode', 'cross'),
             'warm_up_candles': self.user_config.get('warm_up_candles', 210),
@@ -281,6 +287,8 @@ class MonteCarloRunner:
             'starting_balance': self.user_config.get('starting_balance', 10000),
             'fee': self.user_config.get('fee', 0.0005),
             'type': self.user_config.get('exchange', {}).get('type', 'futures'),
+            'simulation_model': self.user_config.get('exchange', {}).get('simulation_model'),
+            'annualization': self.user_config.get('exchange', {}).get('annualization', 365),
             'futures_leverage': self.user_config.get('exchange', {}).get('futures_leverage', 1),
             'futures_leverage_mode': self.user_config.get('exchange', {}).get('futures_leverage_mode', 'cross'),
             'warm_up_candles': self.user_config.get('warm_up_candles', 210),

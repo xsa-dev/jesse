@@ -132,7 +132,7 @@ def test_can_pass_strategy_as_string_in_futures_exchange():
     result = research.backtest(config, routes, data_routes, candles)
 
     # result must have None values because the strategy makes no decisions
-    assert result['metrics'] == {'net_profit_percentage': 0, 'total': 0, 'win_rate': 0}
+    assert result['metrics'] == {'net_profit_percentage': 0, 'total': 0, 'win_rate': 0, 'annualization': 365}
 
 
 def test_can_pass_strategy_as_class_in_a_futures_exchange():
@@ -178,7 +178,7 @@ def test_can_pass_strategy_as_class_in_a_futures_exchange():
     result = research.backtest(config, routes, data_routes, candles)
 
     # result must have None values because the strategy makes no decisions
-    assert result['metrics'] == {'net_profit_percentage': 0, 'total': 0, 'win_rate': 0}
+    assert result['metrics'] == {'net_profit_percentage': 0, 'total': 0, 'win_rate': 0, 'annualization': 365}
 
 
 def test_can_pass_strategy_as_class_in_a_spot_exchange():
@@ -222,7 +222,7 @@ def test_can_pass_strategy_as_class_in_a_spot_exchange():
     result = research.backtest(config, routes, data_routes, candles)
 
     # result must have None values because the strategy makes no decisions
-    assert result['metrics'] == {'net_profit_percentage': 0, 'total': 0, 'win_rate': 0}
+    assert result['metrics'] == {'net_profit_percentage': 0, 'total': 0, 'win_rate': 0, 'annualization': 365}
 
 
 def test_store_state_app_is_reset_properly_in_isolated_backtest():

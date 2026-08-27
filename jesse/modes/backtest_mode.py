@@ -568,6 +568,9 @@ def _step_simulator(
 
     # add initial balance
     save_daily_portfolio_balance(is_initial=True)
+    # Preserve Jesse's historical first sample after row 1,440, then keep a
+    # fixed daily schedule so delayed sparse rows do not shift later samples.
+    next_balance_sample_time = int(store.app.time) + 86_460_000
 
     progressbar = Progressbar(length, step=420)
     last_update_time = None
@@ -709,8 +712,12 @@ def _step_simulator(
         # now check to see if there's any MARKET orders waiting to be executed
         execute_simulated_market_orders()
 
-        if i != 0 and i % 1440 == 0:
+        # Timestamp-based sampling keeps sparse market closures as real gaps
+        # instead of treating 1,440 available rows as one calendar day.
+        if int(store_app.time) >= next_balance_sample_time:
             save_daily_portfolio_balance()
+            while next_balance_sample_time <= int(store_app.time):
+                next_balance_sample_time += 86_400_000
 
     _finish_progress_bar(progressbar, run_silently)
 
@@ -1262,6 +1269,9 @@ def _skip_simulator(
 
     # add initial balance
     save_daily_portfolio_balance(is_initial=True)
+    # Preserve Jesse's historical first sample after row 1,440, then keep a
+    # fixed daily schedule so delayed sparse rows do not shift later samples.
+    next_balance_sample_time = int(store.app.time) + 86_460_000
 
     candles_step = _calculate_minimum_candle_step()
 
@@ -1324,8 +1334,12 @@ def _skip_simulator(
         # now check to see if there's any MARKET orders waiting to be executed
         order_service.execute_simulated_market_orders()
 
-        if i != 0 and i % 1440 == 0:
+        # Timestamp-based sampling keeps sparse market closures as real gaps
+        # instead of treating 1,440 available rows as one calendar day.
+        if int(store.app.time) >= next_balance_sample_time:
             save_daily_portfolio_balance()
+            while next_balance_sample_time <= int(store.app.time):
+                next_balance_sample_time += 86_400_000
 
     _finish_progress_bar(progressbar, run_silently)
 

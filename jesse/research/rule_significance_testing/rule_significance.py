@@ -26,10 +26,11 @@ import warnings
 from typing import Dict, List, Optional
 
 import numpy as np
+from jesse.services.simulation_assumptions import resolve_annualization
 
 from .common import (
     MIN_OBSERVATIONS,
-    _annualization_factor,
+    _elapsed_annualization_factor,
     _setup_progress_bar,
     _resolve_cpu_cores,
 )
@@ -94,7 +95,7 @@ def rule_significance_test(
     -------
     dict with keys:
         observed_mean     float       mean next-bar log return of the rule
-        annualized_return float       observed_mean × bars per 365-day year
+        annualized_return float       observed_mean annualized over actual elapsed calendar time
         simulated_means   np.ndarray  shape (n_simulations,)
         p_value           float       fraction of sims ≥ observed_mean
         n_simulations     int         simulations actually completed
@@ -143,6 +144,7 @@ def rule_significance_test(
         )
         close_prices = close_prices[~nan_mask]
         signals = signals[~nan_mask]
+        bar_timestamps = bar_timestamps[~nan_mask]
 
     # ------------------------------------------------------------------
     # Log returns & detrending
@@ -213,11 +215,17 @@ def rule_significance_test(
     # p-value: fraction of simulated means that equalled or exceeded the
     # observed mean under the null hypothesis.
     p_value = float(np.mean(sim_means >= observed_mean))
-    annualization_factor = _annualization_factor(routes[0]['timeframe'])
+    annualization = int(resolve_annualization(config))
+    annualization_factor = _elapsed_annualization_factor(
+        n_obs,
+        int(bar_timestamps[0]),
+        int(bar_timestamps[-1]),
+    )
 
     return {
         'observed_mean': observed_mean,
         'annualized_return': observed_mean * annualization_factor,
+        'annualization': annualization,
         'simulated_means': sim_means,
         'p_value': p_value,
         'n_simulations': len(sim_means),

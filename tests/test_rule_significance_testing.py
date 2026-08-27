@@ -9,7 +9,10 @@ import jesse.helpers as jh
 import jesse.indicators as ta
 from jesse import research
 from jesse.config import config
-from jesse.research.rule_significance_testing.common import _annualization_factor
+from jesse.research.rule_significance_testing.common import (
+    _annualization_factor,
+    _elapsed_annualization_factor,
+)
 from jesse.routes import router
 from jesse.store import store
 from jesse.strategies import Strategy
@@ -267,3 +270,9 @@ def test_significance_run_cleans_runtime_after_strategy_failure():
 )
 def test_annualization_uses_route_timeframe(timeframe, expected_bars_per_year):
     assert _annualization_factor(timeframe) == expected_bars_per_year
+
+
+def test_elapsed_annualization_uses_actual_stock_observation_density():
+    year_ms = 365 * 86_400_000
+
+    assert _elapsed_annualization_factor(252 * 390, 0, year_ms) == 252 * 390

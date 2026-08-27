@@ -86,7 +86,9 @@ class SignificanceTestRunner:
 
     def _publish_general_info(self):
         sync_publish('general_info', {
-            'started_at': jh.timestamp_to_arrow(self.start_time).humanize(),
+            'started_at': jh.timestamp_to_arrow(self.start_time).humanize(
+                jh.timestamp_to_arrow(jh.now(force_fresh=True))
+            ),
             'n_simulations': self.n_simulations,
         })
 
@@ -94,11 +96,14 @@ class SignificanceTestRunner:
         from jesse.research.rule_significance_testing import rule_significance_test, plot_significance_test
 
         # Build config same format as research.backtest()
-        # Fee, balance, type, leverage are hardcoded - they do not affect rule significance testing
+        exchange_config = self.user_config.get('exchange', {})
+        # Fee, balance, and leverage do not affect this signal-only calculation.
         config = {
             'starting_balance': 10000,
             'fee': 0,
-            'type': 'futures',
+            'type': exchange_config.get('type', 'futures'),
+            'simulation_model': exchange_config.get('simulation_model'),
+            'annualization': exchange_config.get('annualization', 365),
             'futures_leverage': 1,
             'futures_leverage_mode': 'cross',
             'warm_up_candles': self.user_config.get('warm_up_candles', 210),

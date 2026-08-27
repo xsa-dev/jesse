@@ -8,13 +8,16 @@ from jesse import exceptions
 
 
 def _formatted_inputs_for_isolated_backtest(user_config, routes):
+    exchange_config = user_config['exchange']
     # Format input parameters required for backtest simulation
     return {
-        'starting_balance': user_config['exchange']['balance'],
-        'fee': user_config['exchange']['fee'],
-        'type': user_config['exchange']['type'],
-        'futures_leverage': user_config['exchange']['futures_leverage'],
-        'futures_leverage_mode': user_config['exchange']['futures_leverage_mode'],
+        'starting_balance': exchange_config['balance'],
+        'fee': exchange_config['fee'],
+        'type': exchange_config['type'],
+        'simulation_model': exchange_config.get('simulation_model'),
+        'annualization': exchange_config.get('annualization', 365),
+        'futures_leverage': exchange_config.get('futures_leverage', 1),
+        'futures_leverage_mode': exchange_config.get('futures_leverage_mode', 'cross'),
         'exchange': routes[0]['exchange'],
         # Research and dashboard coordinators pass their selected warmup value
         # because Ray workers do not share the coordinator's config dictionary.

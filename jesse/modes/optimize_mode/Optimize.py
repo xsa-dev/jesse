@@ -340,12 +340,16 @@ class Optimizer:
 
         # Update the dashboard with general information about the progress
         general_info = {
-            'started_at': jh.timestamp_to_arrow(self.start_time).humanize(),
+            'started_at': jh.timestamp_to_arrow(self.start_time).humanize(
+                jh.timestamp_to_arrow(jh.now(force_fresh=True))
+            ),
             'trial': f'{self.completed_trials}/{self.n_trials}',
             'objective_function': jh.get_config('env.optimization.objective_function', 'sharpe'),
             'exchange_type': self.user_config['exchange']['type'],
-            'leverage_mode': self.user_config['exchange']['futures_leverage_mode'],
-            'leverage': self.user_config['exchange']['futures_leverage'],
+            'simulation_model': self.user_config['exchange'].get('simulation_model'),
+            'annualization': self.user_config['exchange'].get('annualization', 365),
+            'leverage_mode': self.user_config['exchange'].get('futures_leverage_mode', 'N/A'),
+            'leverage': self.user_config['exchange'].get('futures_leverage', 'N/A'),
             'cpu_cores': self.cpu_cores,
         }
         sync_publish('general_info', general_info)
