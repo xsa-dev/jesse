@@ -27,6 +27,7 @@ from jesse.modes.import_candles_mode.drivers.KuCoin.KuCoinFuturesMain import (
 from jesse.modes.import_candles_mode.drivers.KuCoin.KuCoinSpotMain import KuCoinSpotMain
 from jesse.modes.import_candles_mode.drivers.Lighter.LighterMain import LighterMain
 from jesse.modes.import_candles_mode.drivers.interface import CandleExchange
+from jesse.services.historical_data import HistoricalCandleRange, HistoricalCandleRequest
 
 
 START_TIMESTAMP = 1_700_000_040_000
@@ -225,6 +226,37 @@ def test_registered_driver_fetch_contract(monkeypatch, driver_class):
         'low': 0.5,
         'volume': 4.0,
     }
+    assert captured[start_key] == expected_start
+
+
+@pytest.mark.parametrize('driver_class', drivers.values(), ids=drivers.keys())
+def test_registered_driver_normalized_fetch_contract(monkeypatch, driver_class):
+    driver = driver_class()
+    captured = {}
+    symbol, start_key, expected_start = _mock_fetch_response(monkeypatch, driver, captured)
+    request = HistoricalCandleRequest(
+        symbol=symbol,
+        timeframe='1m',
+        requested_range=HistoricalCandleRange(
+            START_TIMESTAMP,
+            START_TIMESTAMP + driver.count * 60_000,
+        ),
+    )
+
+    batch = driver.fetch_candles(request)
+
+    assert batch.request == request
+    assert len(batch.candles) == 1
+    candle = batch.candles[0]
+    assert (
+        candle.timestamp,
+        candle.open,
+        candle.close,
+        candle.high,
+        candle.low,
+        candle.volume,
+    ) == (START_TIMESTAMP, 1.0, 2.0, 3.0, 0.5, 4.0)
+    assert batch.continuation_token is None
     assert captured[start_key] == expected_start
 
 

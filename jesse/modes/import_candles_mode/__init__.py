@@ -9,7 +9,11 @@ import pydash
 import jesse.helpers as jh
 from jesse.exceptions import CandleNotFoundInExchange
 from jesse.models.Candle import Candle
-from jesse.modes.import_candles_mode.drivers import drivers, driver_names
+from jesse.modes.import_candles_mode.drivers import (
+    build_crypto_historical_provider_registry,
+    drivers,
+    driver_names,
+)
 from jesse.modes.import_candles_mode.drivers.interface import CandleExchange
 from jesse.config import config
 from jesse.services.failure import register_custom_exception_handler
@@ -18,6 +22,10 @@ from jesse.services.env import ENV_VALUES
 from jesse.store import store
 from jesse import exceptions
 from jesse.services.progressbar import Progressbar
+from jesse.services.historical_data import (
+    HistoricalCandleRange,
+    HistoricalCandleRequest,
+)
 
 
 # Small gaps at the beginning or end of a requested range can be filled with
@@ -217,7 +225,10 @@ def _run(
     days_count = jh.date_diff_in_days(start_date, until_date)
     candles_count = days_count * 1440
 
-    driver: CandleExchange = drivers[exchange]()
+    provider = build_crypto_historical_provider_registry((exchange,)).get(exchange)
+    if not isinstance(provider, CandleExchange):
+        raise TypeError(f'Crypto provider {exchange!r} must implement CandleExchange compatibility')
+    driver = provider
 
     loop_length = int(candles_count / driver.count) + 1
 
@@ -254,7 +265,9 @@ def _run(
                 temp_end_timestamp = arrow.utcnow().floor('minute').int_timestamp * 1000 - 60000
 
             # fetch from market
-            candles = driver.fetch(symbol, temp_start_timestamp, timeframe='1m')
+            candles = _fetch_normalized_candles(
+                driver, symbol, temp_start_timestamp, temp_end_timestamp, timeframe='1m'
+            )
             _raise_if_cancelled(client_id, running_via_dashboard)
 
             # check if candles have been returned and check those returned start with the right timestamp.
@@ -439,7 +452,9 @@ def _get_candles_from_backup_exchange(exchange: str, backup_driver: CandleExchan
                 temp_end_timestamp = arrow.utcnow().floor('minute').int_timestamp * 1000 - 60000
 
             # fetch from market
-            candles = backup_driver.fetch(symbol, temp_start_timestamp)
+            candles = _fetch_normalized_candles(
+                backup_driver, symbol, temp_start_timestamp, temp_end_timestamp, timeframe
+            )
 
             if not len(candles):
                 raise CandleNotFoundInExchange(
@@ -555,6 +570,38 @@ def _fill_absent_candles(temp_candles: List[Dict[str, Union[str, Any]]], start_t
 
         start_timestamp += 60000
     return candles
+
+
+def _fetch_normalized_candles(
+    provider: CandleExchange,
+    symbol: str,
+    start_timestamp: int,
+    end_timestamp: int,
+    timeframe: str,
+) -> List[Dict[str, Union[str, Any]]]:
+    """Fetch an inclusive storage range through the provider's half-open normalized contract."""
+    interval = jh.timeframe_to_one_minutes(timeframe) * 60_000
+    request = HistoricalCandleRequest(
+        symbol=symbol,
+        timeframe=timeframe,
+        requested_range=HistoricalCandleRange(start_timestamp, end_timestamp + interval),
+    )
+    batch = provider.fetch_candles(request)
+    return [
+        {
+            'id': jh.generate_unique_id(),
+            'exchange': provider.name,
+            'symbol': symbol,
+            'timeframe': timeframe,
+            'timestamp': candle.timestamp,
+            'open': candle.open,
+            'close': candle.close,
+            'high': candle.high,
+            'low': candle.low,
+            'volume': candle.volume,
+        }
+        for candle in batch.candles
+    ]
 
 
 def store_candles_list(candles: List[Dict]) -> None:

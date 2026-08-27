@@ -24,6 +24,7 @@ from jesse.modes.import_candles_mode.drivers.KuCoin.KuCoinUSDTPerpetual import K
 from jesse.modes.import_candles_mode.drivers.Kraken.KrakenSpot import KrakenSpot
 from jesse.modes.import_candles_mode.drivers.Kraken.KrakenPerpetual import KrakenPerpetual
 from jesse.modes.import_candles_mode.drivers.Kraken.KrakenPerpetualTestnet import KrakenPerpetualTestnet
+from jesse.services.historical_data import HistoricalCandleProviderRegistry
 
 
 drivers = {
@@ -58,3 +59,18 @@ drivers = {
 
 
 driver_names = list(drivers.keys())
+
+
+def build_crypto_historical_provider_registry(
+    provider_ids: tuple[str, ...] | None = None,
+) -> HistoricalCandleProviderRegistry:
+    """Build fresh crypto providers so sessions and rate-limit state are not shared between imports."""
+    registry = HistoricalCandleProviderRegistry()
+    selected_provider_ids = tuple(drivers) if provider_ids is None else provider_ids
+    for provider_id in selected_provider_ids:
+        provider_class = drivers.get(provider_id)
+        if provider_class is None:
+            # Use the registry's stable typed lookup error for unknown provider IDs.
+            registry.get(provider_id)
+        registry.register(provider_class())
+    return registry
