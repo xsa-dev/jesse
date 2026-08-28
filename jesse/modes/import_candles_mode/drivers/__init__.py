@@ -24,7 +24,7 @@ from jesse.modes.import_candles_mode.drivers.KuCoin.KuCoinUSDTPerpetual import K
 from jesse.modes.import_candles_mode.drivers.Kraken.KrakenSpot import KrakenSpot
 from jesse.modes.import_candles_mode.drivers.Kraken.KrakenPerpetual import KrakenPerpetual
 from jesse.modes.import_candles_mode.drivers.Kraken.KrakenPerpetualTestnet import KrakenPerpetualTestnet
-from jesse.services.historical_data import HistoricalCandleProviderRegistry
+from jesse.services.historical_data import HistoricalCandleProviderRegistry, MassiveStocksProvider
 
 
 drivers = {
@@ -71,6 +71,21 @@ def build_crypto_historical_provider_registry(
         provider_class = drivers.get(provider_id)
         if provider_class is None:
             # Use the registry's stable typed lookup error for unknown provider IDs.
+            registry.get(provider_id)
+        registry.register(provider_class())
+    return registry
+
+
+def build_historical_provider_registry(
+    provider_ids: tuple[str, ...] | None = None,
+) -> HistoricalCandleProviderRegistry:
+    """Build all import providers without exposing data-only sources as live exchange drivers."""
+    provider_classes = {**drivers, exchanges.MASSIVE_STOCKS: MassiveStocksProvider}
+    registry = HistoricalCandleProviderRegistry()
+    selected_provider_ids = tuple(provider_classes) if provider_ids is None else provider_ids
+    for provider_id in selected_provider_ids:
+        provider_class = provider_classes.get(provider_id)
+        if provider_class is None:
             registry.get(provider_id)
         registry.register(provider_class())
     return registry

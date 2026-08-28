@@ -14,6 +14,7 @@ from .contracts import (
     ProviderCapabilities,
 )
 from .registry import HistoricalCandleProviderRegistry
+from .massive_stocks import MassiveStocksProvider
 
 __all__ = [
     'AdjustmentMode',
@@ -29,5 +30,6 @@ __all__ = [
     'HistoricalDataQualitySummary',
     'HistoricalDataSourceType',
     'InstrumentType',
+    'MassiveStocksProvider',
     'ProviderCapabilities',
 ]
