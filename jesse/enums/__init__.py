@@ -102,6 +102,11 @@ class exchanges:
 
 
 @dataclass
+class data_providers:
+    MASSIVE = 'Massive'
+
+
+@dataclass
 class migration_actions:
     ADD = 'add'
     DROP = 'drop'
