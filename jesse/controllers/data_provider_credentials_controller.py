@@ -5,6 +5,14 @@ from starlette.responses import JSONResponse
 from jesse.enums import data_providers
 from jesse.repositories import data_provider_credentials_repository
 from jesse.services.auth import require_auth
+from jesse.services.historical_data.credential_validation import validate_massive_api_key
+from jesse.services.historical_data.errors import (
+    ProviderAuthenticationError,
+    ProviderEntitlementError,
+    ProviderRateLimitError,
+    ProviderRequestError,
+    ProviderUnavailableError,
+)
 
 
 router = APIRouter(
@@ -39,12 +47,21 @@ class DataProviderCredentialMutationResponse(BaseModel):
     data: DataProviderCredentialStatusResponse
 
 
+class DataProviderCredentialValidationResponse(BaseModel):
+    status: str
+    message: str
+
+
 class StoreDataProviderCredentialsRequest(BaseModel):
     provider_id: str
     api_key: SecretStr
 
 
 class DeleteDataProviderCredentialsRequest(BaseModel):
+    provider_id: str
+
+
+class ValidateDataProviderCredentialsRequest(BaseModel):
     provider_id: str
 
 
@@ -105,4 +122,39 @@ def delete_data_provider_credentials(
         status='success',
         message='Data provider credentials have been deleted successfully.',
         data=status,
+    )
+
+
+@router.post('/credentials/validate', response_model=DataProviderCredentialValidationResponse)
+def validate_data_provider_credentials(
+    request: ValidateDataProviderCredentialsRequest,
+) -> DataProviderCredentialValidationResponse | JSONResponse:
+    if request.provider_id != data_providers.MASSIVE:
+        return _unsupported_provider_response()
+    try:
+        credentials = data_provider_credentials_repository.get_data_provider_credentials(request.provider_id)
+    except Exception:
+        return JSONResponse({'message': 'Unable to load data provider credentials'}, status_code=500)
+    if credentials is None:
+        return JSONResponse({'message': 'No API key is configured for this data provider'}, status_code=404)
+    api_key = credentials.get('api_key')
+    if not api_key:
+        return JSONResponse({'message': 'The stored data provider credentials are invalid'}, status_code=500)
+
+    try:
+        validate_massive_api_key(api_key)
+    except ProviderAuthenticationError:
+        return JSONResponse({'message': 'Massive rejected the API key'}, status_code=401)
+    except ProviderEntitlementError:
+        return JSONResponse({'message': 'The API key cannot access Massive reference data'}, status_code=403)
+    except ProviderRateLimitError:
+        return JSONResponse({'message': 'Massive rate limit reached. Try again shortly.'}, status_code=429)
+    except ProviderUnavailableError:
+        return JSONResponse({'message': 'Massive is currently unavailable'}, status_code=503)
+    except ProviderRequestError:
+        return JSONResponse({'message': 'Massive could not validate the API key'}, status_code=502)
+
+    return DataProviderCredentialValidationResponse(
+        status='success',
+        message='Massive API key is working.',
     )
