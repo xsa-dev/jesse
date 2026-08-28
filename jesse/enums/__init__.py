@@ -65,6 +65,7 @@ class order_types:
 @dataclass
 class exchanges:
     SANDBOX = 'Sandbox'
+    MASSIVE_STOCKS = 'Massive Stocks'
     COINBASE_SPOT = 'Coinbase Spot'
     BITFINEX_SPOT = 'Bitfinex Spot'
     BINANCE_SPOT = 'Binance Spot'

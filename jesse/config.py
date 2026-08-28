@@ -121,7 +121,7 @@ for key in exchange_info:
     config['env']['exchanges'][key] = {
         'fee': exchange_info[key]['fee'],
         'type': exchange_info[key]['type'],
-        'annualization': Annualization.CALENDAR_365,
+        'annualization': resolve_annualization(exchange_info[key]),
         'futures_leverage_mode': 'cross',
         'futures_leverage': 1,
         'balance': 10_000

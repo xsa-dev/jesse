@@ -528,15 +528,34 @@ exchange_info = {
         },
         "required_live_plan": "free",
     },
+    exchanges_enums.MASSIVE_STOCKS: {
+        "name": exchanges_enums.MASSIVE_STOCKS,
+        "url": "https://massive.com",
+        # Massive is a historical data source, so execution fees remain a run setting.
+        "fee": 0.0,
+        "type": "spot",
+        "supported_leverage_modes": [],
+        "supported_timeframes": [timeframes.MINUTE_1],
+        "modes": {
+            # Exposure waits for the provider, sparse importer, and replay path.
+            "backtesting": False,
+            "live_trading": False,
+        },
+        "required_live_plan": "premium",
+        "asset_class": "equity",
+        "instrument_type": "stock",
+        "simulation_model": "spot",
+        "annualization": 252,
+    },
 }
 
-# Existing exchange drivers are all crypto venues. Historical candle datasets
-# carry their own classifications and do not enter this live exchange registry.
+# Trading exchange entries are crypto unless a historical source declares its
+# own classification and simulation assumptions.
 for _exchange in exchange_info.values():
-    _exchange['asset_class'] = 'crypto'
-    _exchange['instrument_type'] = 'perpetual' if _exchange['type'] == 'futures' else 'spot'
-    _exchange['simulation_model'] = 'perpetual_futures' if _exchange['type'] == 'futures' else 'spot'
-    _exchange['annualization'] = 365
+    _exchange.setdefault('asset_class', 'crypto')
+    _exchange.setdefault('instrument_type', 'perpetual' if _exchange['type'] == 'futures' else 'spot')
+    _exchange.setdefault('simulation_model', 'perpetual_futures' if _exchange['type'] == 'futures' else 'spot')
+    _exchange.setdefault('annualization', 365)
 
 # list of supported exchanges for backtesting
 backtesting_exchanges = [k for k, v in exchange_info.items() if v['modes']['backtesting'] is True]
