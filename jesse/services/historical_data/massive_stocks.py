@@ -1,8 +1,11 @@
+import hashlib
+import json
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from math import isfinite
+from threading import Lock
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlparse
 
@@ -10,6 +13,7 @@ import requests
 
 from jesse.enums import data_providers, exchanges
 from jesse.repositories import data_provider_credentials_repository
+from jesse.services.redis import sync_redis
 
 from .contracts import (
     AdjustmentMode,
@@ -51,10 +55,19 @@ MASSIVE_REQUEST_TIMEOUT_SECONDS = 30
 MASSIVE_MAX_RETRY_DELAY_SECONDS = 60.0
 # At 50,000 base bars per page, 1,000 pages exceed the provider's complete stock-minute history.
 MASSIVE_MAX_PAGES = 1_000
-# Massive's entry plans allow five requests per minute; paid plans remain compatible with this baseline.
-MASSIVE_REQUEST_DELAY_SECONDS = 12.0
+# Free plans allow five requests per minute; paid plans stay unpaced until Massive reports a 429.
+MASSIVE_FREE_REQUEST_INTERVAL_SECONDS = 12.0
+# Without Retry-After, wait for the documented free-tier window to reset before retrying.
+MASSIVE_RATE_LIMIT_FALLBACK_SECONDS = 60.0
+# A continuously used free-tier marker stays alive; idle or replaced credentials are probed again later.
+MASSIVE_RATE_LIMIT_STATE_TTL_SECONDS = 3_600
 # Fifty responsive selector results avoid downloading Massive's full equity catalog on every search.
 MASSIVE_TICKER_SEARCH_LIMIT = 50
+
+# Provider instances share process-local pacing so concurrent calls to one Massive product respect
+# a detected free-tier limit without slowing unrelated paid products.
+_massive_request_schedule: dict[str, tuple[float, float]] = {}
+_massive_request_schedule_lock = Lock()
 
 
 def _load_massive_api_key() -> str:
@@ -81,10 +94,16 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
         credential_loader: Callable[[], str] | None = None,
         session: requests.Session | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_time: Callable[[], float] = time.time,
     ) -> None:
         self._credential_loader = credential_loader or _load_massive_api_key
+        # Injected sessions are fixture boundaries and should not touch the application's Redis limiter.
+        self._use_shared_rate_limit = session is None
         self._session = session or requests.Session()
         self._sleep = sleep
+        self._monotonic = monotonic
+        self._wall_time = wall_time
 
     def _fetch_candles(self, request: HistoricalCandleRequest) -> HistoricalCandleBatch:
         if request.adjustment_mode is not self.capabilities.default_adjustment_mode:
@@ -133,7 +152,6 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
             if next_url is None:
                 candles = tuple(candles_by_timestamp[timestamp] for timestamp in sorted(candles_by_timestamp))
                 return HistoricalCandleBatch(request, candles)
-            self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
             url = _validated_next_url(next_url)
             params = None
 
@@ -162,7 +180,7 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
         symbols = []
         seen_symbols = set()
         symbol_markets: dict[str, str] = {}
-        for market_index, market in enumerate(self.markets):
+        for market in self.markets:
             url = MASSIVE_TICKERS_URL
             params: dict[str, str | int] | None = {
                 'market': market,
@@ -191,13 +209,10 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
                 next_url = payload.get('next_url')
                 if next_url is None:
                     break
-                self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
                 url = _validated_next_url(next_url)
                 params = None
             else:
                 raise ProviderPaginationError('Massive ticker pagination exceeded the safety limit')
-            if market_index + 1 < len(self.markets):
-                self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
         if not symbols:
             raise ProviderSchemaError(f'Massive returned an empty active-{",".join(self.markets)} catalog')
         return tuple(sorted(symbols))
@@ -209,6 +224,7 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
         params: dict[str, str | int] | None,
     ) -> Mapping[str, Any]:
         for attempt in range(MASSIVE_REQUEST_ATTEMPTS):
+            self._wait_for_request_slot(api_key)
             try:
                 response = self._session.get(
                     url,
@@ -230,7 +246,11 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
                     return payload
                 if isinstance(error, ProviderQuotaError):
                     raise error
-                if isinstance(error, ProviderRateLimitError) or response.status_code >= 500:
+                if isinstance(error, ProviderRateLimitError):
+                    self._activate_free_tier_pacing(api_key, response.headers.get('Retry-After'))
+                    if attempt + 1 < MASSIVE_REQUEST_ATTEMPTS:
+                        continue
+                elif response.status_code >= 500:
                     if attempt + 1 < MASSIVE_REQUEST_ATTEMPTS:
                         self._sleep(_retry_delay(response.headers.get('Retry-After'), attempt))
                         continue
@@ -239,6 +259,90 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
                 response.close()
 
         raise ProviderUnavailableError('Massive is currently unavailable')
+
+    def _wait_for_request_slot(self, api_key: str) -> None:
+        schedule_key = self._rate_limit_schedule_key(api_key)
+        if self._use_shared_rate_limit and self._wait_for_shared_request_slot(schedule_key):
+            return
+        self._wait_for_local_request_slot(schedule_key)
+
+    def _wait_for_shared_request_slot(self, schedule_key: str) -> bool:
+        state_key = f'massive-rate-limit:{schedule_key}'
+        try:
+            if sync_redis.get(state_key) is None:
+                return False
+            while True:
+                with sync_redis.lock(f'{state_key}:lock', timeout=10, blocking_timeout=10):
+                    raw_state = sync_redis.get(state_key)
+                    if raw_state is None:
+                        return False
+                    interval, next_request_at = _decode_rate_limit_state(raw_state)
+                    now = self._wall_time()
+                    if next_request_at <= now:
+                        sync_redis.set(
+                            state_key,
+                            json.dumps((interval, now + interval)),
+                            ex=MASSIVE_RATE_LIMIT_STATE_TTL_SECONDS,
+                        )
+                        return True
+                    delay = next_request_at - now
+                self._sleep(delay)
+        except Exception:
+            # Redis availability must not prevent historical imports; local pacing remains safe per process.
+            return False
+
+    def _wait_for_local_request_slot(self, schedule_key: str) -> None:
+        while True:
+            now = self._monotonic()
+            with _massive_request_schedule_lock:
+                state = _massive_request_schedule.get(schedule_key)
+                if state is None:
+                    return
+                interval, next_request_at = state
+                if next_request_at <= now:
+                    _massive_request_schedule[schedule_key] = (interval, now + interval)
+                    return
+                delay = next_request_at - now
+            self._sleep(delay)
+
+    def _activate_free_tier_pacing(self, api_key: str, retry_after: str | None) -> None:
+        now = self._monotonic()
+        retry_delay = (
+            _retry_delay(retry_after, 0)
+            if retry_after is not None
+            else MASSIVE_RATE_LIMIT_FALLBACK_SECONDS
+        )
+        blocked_until = now + max(retry_delay, MASSIVE_FREE_REQUEST_INTERVAL_SECONDS)
+        schedule_key = self._rate_limit_schedule_key(api_key)
+        with _massive_request_schedule_lock:
+            _, next_request_at = _massive_request_schedule.get(schedule_key, (0.0, 0.0))
+            _massive_request_schedule[schedule_key] = (
+                MASSIVE_FREE_REQUEST_INTERVAL_SECONDS,
+                max(next_request_at, blocked_until),
+            )
+        if not self._use_shared_rate_limit:
+            return
+        state_key = f'massive-rate-limit:{schedule_key}'
+        try:
+            shared_blocked_until = self._wall_time() + max(
+                retry_delay,
+                MASSIVE_FREE_REQUEST_INTERVAL_SECONDS,
+            )
+            with sync_redis.lock(f'{state_key}:lock', timeout=10, blocking_timeout=10):
+                raw_state = sync_redis.get(state_key)
+                next_request_at = _decode_rate_limit_state(raw_state)[1] if raw_state is not None else 0.0
+                sync_redis.set(
+                    state_key,
+                    json.dumps((MASSIVE_FREE_REQUEST_INTERVAL_SECONDS, max(next_request_at, shared_blocked_until))),
+                    ex=MASSIVE_RATE_LIMIT_STATE_TTL_SECONDS,
+                )
+        except Exception:
+            pass
+
+    def _rate_limit_schedule_key(self, api_key: str) -> str:
+        # Only a non-reversible fingerprint enters process state or Redis; the API key never does.
+        credential_fingerprint = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+        return f'{self.provider_id}:{credential_fingerprint}'
 
     def _provider_symbol(self, symbol: str, api_key: str) -> str:
         raise NotImplementedError
@@ -257,7 +361,6 @@ class MassiveStocksProvider(MassiveAggregatesProvider):
         native_timeframes=('1m',),
         adjustment_modes=(AdjustmentMode.SPLIT_ADJUSTED,),
         max_candles_per_request=MASSIVE_PAGE_LIMIT,
-        request_delay_seconds=MASSIVE_REQUEST_DELAY_SECONDS,
         default_adjustment_mode=AdjustmentMode.SPLIT_ADJUSTED,
     )
 
@@ -280,7 +383,6 @@ class MassiveCurrenciesProvider(MassiveAggregatesProvider):
         ticker_search=True,
         native_timeframes=('1m',),
         max_candles_per_request=MASSIVE_PAGE_LIMIT,
-        request_delay_seconds=MASSIVE_REQUEST_DELAY_SECONDS,
     )
 
     def __init__(self, *args, **kwargs) -> None:
@@ -293,7 +395,7 @@ class MassiveCurrenciesProvider(MassiveAggregatesProvider):
         if cached_symbol is not None:
             return cached_symbol
         provider_symbols = set()
-        for index, (market, provider_symbol) in enumerate((('fx', f'C:{joined_symbol}'), ('crypto', f'X:{joined_symbol}'))):
+        for market, provider_symbol in (('fx', f'C:{joined_symbol}'), ('crypto', f'X:{joined_symbol}')):
             payload = self._request_json(
                 MASSIVE_TICKERS_URL,
                 api_key,
@@ -309,16 +411,12 @@ class MassiveCurrenciesProvider(MassiveAggregatesProvider):
                 for result in _ticker_results(payload, (market,))
                 if (ticker := _catalog_ticker(result)) == provider_symbol
             )
-            if index == 0:
-                self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
         if len(provider_symbols) != 1:
             raise ProviderSymbolNotFoundError(
                 f'Massive Currencies could not resolve {symbol!r} to one Forex or Crypto ticker'
             )
         provider_symbol = provider_symbols.pop()
         self._resolved_symbols[joined_symbol] = provider_symbol
-        # The aggregate request follows immediately; preserve the entry-plan request interval.
-        self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
         return provider_symbol
 
     def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
@@ -334,7 +432,6 @@ class MassiveIndicesProvider(MassiveAggregatesProvider):
         ticker_search=True,
         native_timeframes=('1m',),
         max_candles_per_request=MASSIVE_PAGE_LIMIT,
-        request_delay_seconds=MASSIVE_REQUEST_DELAY_SECONDS,
     )
 
     def _provider_symbol(self, symbol: str, api_key: str) -> str:
@@ -357,7 +454,6 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
         ticker_search=True,
         native_timeframes=('1m',),
         max_candles_per_request=MASSIVE_PAGE_LIMIT,
-        request_delay_seconds=MASSIVE_REQUEST_DELAY_SECONDS,
     )
 
     def __init__(self, *args, **kwargs) -> None:
@@ -399,7 +495,6 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
                     request,
                     tuple(candles_by_timestamp[timestamp] for timestamp in sorted(candles_by_timestamp)),
                 )
-            self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
             url = _validated_next_url(next_url)
             params = None
 
@@ -416,7 +511,6 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
     def list_symbols(self) -> tuple[str, ...]:
         api_key = self._credential_loader()
         product_currencies = self._load_product_currencies(api_key)
-        self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
         url = MASSIVE_FUTURES_CONTRACTS_URL
         params: dict[str, str | int] | None = {
             'type': 'single',
@@ -442,7 +536,6 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
                 if not symbols:
                     raise ProviderSchemaError('Massive Futures returned an empty active-contract catalog')
                 return tuple(symbols)
-            self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
             url = _validated_next_url(next_url)
             params = None
         raise ProviderPaginationError('Massive Futures contract pagination exceeded the safety limit')
@@ -474,7 +567,6 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
                 if not currencies:
                     raise ProviderSchemaError('Massive Futures returned an empty product catalog')
                 return currencies
-            self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
             url = _validated_next_url(next_url)
             params = None
         raise ProviderPaginationError('Massive Futures product pagination exceeded the safety limit')
@@ -500,7 +592,6 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
         product_code = contracts[0].get('product_code')
         if not isinstance(product_code, str) or not product_code.strip():
             raise ProviderSchemaError('Massive Futures contracts require a product_code')
-        self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
         product_payload = self._request_json(
             MASSIVE_FUTURES_PRODUCTS_URL,
             api_key,
@@ -513,7 +604,6 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
                 f'Massive Futures contract {provider_symbol!r} does not use currency {quote_asset!r}'
             )
         self._resolved_symbols[normalized_symbol] = provider_symbol
-        self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
         return provider_symbol
 
     def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
@@ -858,3 +948,18 @@ def _retry_delay(retry_after: str | None, attempt: int) -> float:
             delay = 2 ** attempt
         return min(max(delay, 0.0), MASSIVE_MAX_RETRY_DELAY_SECONDS)
     return float(2 ** attempt)
+
+
+def _decode_rate_limit_state(value: str | bytes) -> tuple[float, float]:
+    decoded_value = value.decode() if isinstance(value, bytes) else value
+    state = json.loads(decoded_value)
+    if (
+        not isinstance(state, list)
+        or len(state) != 2
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in state)
+    ):
+        raise ValueError('Invalid Massive rate-limit state')
+    interval, next_request_at = float(state[0]), float(state[1])
+    if not isfinite(interval) or interval < 0 or not isfinite(next_request_at):
+        raise ValueError('Invalid Massive rate-limit state')
+    return interval, next_request_at
