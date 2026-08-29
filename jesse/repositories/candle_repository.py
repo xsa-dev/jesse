@@ -1,8 +1,17 @@
 from jesse.models.Candle import Candle
 import jesse.helpers as jh
-from typing import List
+from collections.abc import Sequence
+from typing import List, TYPE_CHECKING
 import numpy as np
 import arrow
+import peewee
+
+if TYPE_CHECKING:
+    from jesse.services.historical_data.contracts import HistoricalCandle
+
+
+# Nine values are bound per row; 5,000 remains below PostgreSQL's 65,535 bind-parameter limit.
+OBSERVED_CANDLE_INSERT_BATCH_SIZE = 5_000
 
 
 def delete_candles_from_db(exchange: str, symbol: str) -> None:
@@ -80,6 +89,59 @@ def fetch_candles_from_db(exchange: str, symbol: str, timeframe: str, start_date
     )
 
     return res
+
+
+def get_candle_timestamp_bounds(exchange: str, symbol: str, timeframe: str) -> tuple[int | None, int | None]:
+    """Return the first and latest stored timestamps for one canonical candle series."""
+    timeframe_condition = Candle.timeframe == timeframe
+    if timeframe == '1m':
+        # Older imports may have stored one-minute rows before the timeframe column was populated.
+        timeframe_condition = timeframe_condition | Candle.timeframe.is_null()
+    first_timestamp, last_timestamp = (
+        Candle.select(
+            peewee.fn.MIN(Candle.timestamp),
+            peewee.fn.MAX(Candle.timestamp),
+        )
+        .where(
+            Candle.exchange == exchange,
+            Candle.symbol == symbol,
+            timeframe_condition,
+        )
+        .tuples()
+        .get()
+    )
+    return (
+        int(first_timestamp) if first_timestamp is not None else None,
+        int(last_timestamp) if last_timestamp is not None else None,
+    )
+
+
+def store_observed_candles(
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    candles: Sequence['HistoricalCandle'],
+) -> None:
+    """Persist one provider page atomically while retaining existing canonical rows."""
+    # SQL batching respects PostgreSQL's bind limit; the outer transaction preserves resumable boundaries.
+    with Candle._meta.database.atomic():
+        for offset in range(0, len(candles), OBSERVED_CANDLE_INSERT_BATCH_SIZE):
+            rows = [
+                {
+                    'id': jh.generate_unique_id(),
+                    'exchange': exchange,
+                    'symbol': symbol,
+                    'timeframe': timeframe,
+                    'timestamp': candle.timestamp,
+                    'open': candle.open,
+                    'close': candle.close,
+                    'high': candle.high,
+                    'low': candle.low,
+                    'volume': candle.volume,
+                }
+                for candle in candles[offset:offset + OBSERVED_CANDLE_INSERT_BATCH_SIZE]
+            ]
+            Candle.insert_many(rows).on_conflict_ignore().execute()
 
 
 def store_candles_into_db(exchange: str, symbol: str, timeframe: str, candles: np.ndarray, on_conflict='ignore') -> None:

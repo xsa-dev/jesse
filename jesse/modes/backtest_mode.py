@@ -469,12 +469,14 @@ def load_candles(start_date: int, finish_date: int) -> Tuple[dict, dict]:
                 f"Missing trading candles for {symbol} on {exchange}"
             )
 
-        # Check that the first trading candle covers the requested start date.
-        if trading_candle_arr[0][0] > start_date:
-            _handle_missing_candles(exchange, symbol, start_date)
-
-        # Check that the last trading candle covers the requested finish date.
-        if trading_candle_arr[-1][0] < (finish_date - 60_000):
+        try:
+            candle_service.validate_observed_one_minute_candles(trading_candle_arr, exchange, symbol)
+        except ValueError as exc:
+            _handle_missing_candles(exchange, symbol, start_date, str(exc))
+        if not _supports_observed_timestamp_replay_scope() and (
+            trading_candle_arr[0, 0] > start_date
+            or trading_candle_arr[-1, 0] < finish_date - 60_000
+        ):
             _handle_missing_candles(exchange, symbol, start_date)
 
         # add trading candles
@@ -497,41 +499,73 @@ def _handle_warmup_candles(warmup_candles: dict, start_date: str) -> None:
     try:
         for c in config['app']['considering_candles']:
             exchange, symbol = c[0], c[1]
-            candle_service.inject_warmup_candles_to_store(warmup_candles[jh.key(exchange, symbol)]['candles'], exchange, symbol)
+            candle_array = warmup_candles[jh.key(exchange, symbol)]['candles']
+            candle_service.validate_observed_one_minute_candles(candle_array, exchange, symbol)
+            if _has_sparse_timestamps(candle_array) and not _supports_observed_timestamp_replay_scope():
+                raise exceptions.InvalidRoutes(
+                    'Sparse candle replay currently supports one trading route, one symbol, and the 1m timeframe.'
+                )
+            candle_service.inject_warmup_candles_to_store(candle_array, exchange, symbol)
     except ValueError as e:
-        # Extract exchange and symbol from error message
-        match = re.search(r"for (.*?)/(.*?)\?", str(e))
-        if match:
-            exchange, symbol = match.groups()
-            
-            # Calculate warmup start date using the same logic as load_candles()
-            warmup_num = jh.get_config('env.data.warmup_candles_num', 210)
-            max_timeframe = jh.max_timeframe(config['app']['considering_timeframes'])
-            # Convert max_timeframe to minutes and multiply by warmup_num
-            warmup_minutes = TIMEFRAME_TO_ONE_MINUTES[max_timeframe] * warmup_num
-            warmup_start_timestamp = jh.date_to_timestamp(start_date) - (warmup_minutes * 60_000)
-            warmup_start_date = jh.timestamp_to_date(warmup_start_timestamp)
-            # Publish the missing candles error to the frontend
-            # This will trigger the alert in the BacktestTab.vue component
-            # so that the user can import the missing candles
-            sync_publish(
-                "missing_candles",
-                {
-                    "message": f'Missing warmup candles for {symbol} on {exchange} from {warmup_start_date}',
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "start_date": warmup_start_date,
-                },
-            )
-            raise exceptions.CandlesNotFound(str(e))
-        raise e
+        # This date is an import suggestion; sparse 1m warmup itself counts observed rows.
+        warmup_num = jh.get_config('env.data.warmup_candles_num', 210)
+        max_timeframe = jh.max_timeframe(config['app']['considering_timeframes'])
+        warmup_minutes = TIMEFRAME_TO_ONE_MINUTES[max_timeframe] * warmup_num
+        warmup_start_timestamp = jh.date_to_timestamp(start_date) - (warmup_minutes * 60_000)
+        warmup_start_date = jh.timestamp_to_date(warmup_start_timestamp)
+        sync_publish(
+            "missing_candles",
+            {
+                "message": f'Missing warmup candles for {symbol} on {exchange} from {warmup_start_date}',
+                "symbol": symbol,
+                "exchange": exchange,
+                "start_date": warmup_start_date,
+            },
+        )
+        raise exceptions.CandlesNotFound(str(e))
 
 
 def simulator(*args, fast_mode: bool = False, **kwargs) -> dict:
+    candles = args[0] if args else kwargs['candles']
+    if _uses_observed_timestamp_replay(candles):
+        # A 1m event has no useful fast-mode batch; both modes consume the same observed timestamps.
+        return _step_simulator(*args, **kwargs)
     if fast_mode:
         return _skip_simulator(*args, **kwargs)
 
     return _step_simulator(*args, **kwargs)
+
+
+def _uses_observed_timestamp_replay(candles: dict) -> bool:
+    """Select or constrain the first sparse-safe replay scope without changing legacy dense routes."""
+    supported_scope = len(candles) == 1 and _supports_observed_timestamp_replay_scope()
+    if supported_scope:
+        return True
+
+    candle_arrays = [candle_data['candles'] for candle_data in candles.values()]
+    sparse = any(_has_sparse_timestamps(candle_array) for candle_array in candle_arrays)
+    timelines_match = all(
+        np.array_equal(candle_array[:, 0], candle_arrays[0][:, 0])
+        for candle_array in candle_arrays[1:]
+    )
+    if sparse or not timelines_match:
+        raise exceptions.InvalidRoutes(
+            'Sparse candle replay currently supports one trading route, one symbol, and the 1m timeframe.'
+        )
+    return False
+
+
+def _supports_observed_timestamp_replay_scope() -> bool:
+    return (
+        len(config['app']['considering_candles']) == 1
+        and len(router.routes) == 1
+        and not router.data_routes
+        and router.routes[0].timeframe == timeframes.MINUTE_1
+    )
+
+
+def _has_sparse_timestamps(candles: np.ndarray) -> bool:
+    return len(candles) < 2 or bool((np.diff(candles[:, 0]) != 60_000).any())
 
 
 def _step_simulator(
@@ -599,7 +633,7 @@ def _step_simulator(
     execute_simulated_market_orders = order_service.execute_simulated_market_orders
 
     # Pipeline-free, ascending float64 candles can be copied into storage once;
-    # each simulation minute then advances the visible storage index.
+    # each observed event then advances the visible storage index.
     prefilled = []
     for candles_arr, candles_pipeline, exchange, symbol in candles_info:
         arr_1m = None
@@ -609,7 +643,7 @@ def _step_simulator(
             # the storage buffer uses float64 rows
             and candles_arr.dtype == np.float64
             and candles_arr.flags.writeable
-            # the loop below indexes candles_arr[i] for i in range(length)
+            # the loop below indexes every observed row in the series
             and len(candles_arr) == length
             # a zero timestamp takes add_candle's special debug/return path
             and not (candles_arr[:, 0] == 0).any()
@@ -642,7 +676,7 @@ def _step_simulator(
         for candles_arr, candles_pipeline, exchange, symbol, arr_1m in candles_info:
             if arr_1m is not None:
                 # The candle is already copied into the storage buffer, so
-                # exposing this minute only requires an index advance.
+                # exposing this observed candle only requires an index advance.
                 short_candle = candles_arr[i]
                 arr_1m.index += 1
             else:

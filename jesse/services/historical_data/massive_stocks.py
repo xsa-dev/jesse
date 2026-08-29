@@ -1,6 +1,6 @@
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from math import isfinite
 from typing import Any
@@ -37,6 +37,10 @@ from .errors import (
 
 MASSIVE_API_HOST = 'api.massive.com'
 MASSIVE_AGGREGATES_URL = f'https://{MASSIVE_API_HOST}/v2/aggs/ticker'
+MASSIVE_TICKERS_URL = f'https://{MASSIVE_API_HOST}/v3/reference/tickers'
+MASSIVE_FUTURES_CONTRACTS_URL = f'https://{MASSIVE_API_HOST}/futures/v1/contracts'
+MASSIVE_FUTURES_PRODUCTS_URL = f'https://{MASSIVE_API_HOST}/futures/v1/products'
+MASSIVE_FUTURES_AGGREGATES_URL = f'https://{MASSIVE_API_HOST}/futures/v1/aggs'
 # Massive documents 50,000 as the custom-aggregate endpoint's maximum base-bar page size.
 MASSIVE_PAGE_LIMIT = 50_000
 # Three attempts cover short network/server failures without making a synchronous import stall indefinitely.
@@ -47,6 +51,10 @@ MASSIVE_REQUEST_TIMEOUT_SECONDS = 30
 MASSIVE_MAX_RETRY_DELAY_SECONDS = 60.0
 # At 50,000 base bars per page, 1,000 pages exceed the provider's complete stock-minute history.
 MASSIVE_MAX_PAGES = 1_000
+# Massive's entry plans allow five requests per minute; paid plans remain compatible with this baseline.
+MASSIVE_REQUEST_DELAY_SECONDS = 12.0
+# Fifty responsive selector results avoid downloading Massive's full equity catalog on every search.
+MASSIVE_TICKER_SEARCH_LIMIT = 50
 
 
 def _load_massive_api_key() -> str:
@@ -60,15 +68,13 @@ def _load_massive_api_key() -> str:
     return api_key
 
 
-class MassiveStocksProvider(HistoricalCandleProvider):
-    """Fetch Massive stock aggregates without exposing it as a live execution exchange."""
+class MassiveAggregatesProvider(HistoricalCandleProvider):
+    """Share Massive's millisecond aggregate and reference APIs across supported markets."""
 
-    provider_id = exchanges.MASSIVE_STOCKS
-    capabilities = ProviderCapabilities(
-        credential_validation=True,
-        native_timeframes=('1m',),
-        adjustment_modes=(AdjustmentMode.SPLIT_ADJUSTED,),
-    )
+    provider_id = ''
+    markets: tuple[str, ...] = ()
+    supports_adjustment = False
+    capabilities = ProviderCapabilities(max_candles_per_request=MASSIVE_PAGE_LIMIT)
 
     def __init__(
         self,
@@ -81,17 +87,21 @@ class MassiveStocksProvider(HistoricalCandleProvider):
         self._sleep = sleep
 
     def _fetch_candles(self, request: HistoricalCandleRequest) -> HistoricalCandleBatch:
-        if request.adjustment_mode is not AdjustmentMode.SPLIT_ADJUSTED:
-            # The single-table phase permits one canonical revision and intentionally chooses split-adjusted bars.
-            raise HistoricalDataRequestError('Massive Stocks currently requires split-adjusted candles')
-        provider_symbol = _massive_symbol(request.symbol)
+        if request.adjustment_mode is not self.capabilities.default_adjustment_mode:
+            raise HistoricalDataRequestError(
+                f'{self.provider_id} requires {self.capabilities.default_adjustment_mode.value} candles'
+            )
         api_key = self._credential_loader()
+        provider_symbol = self._provider_symbol(request.symbol, api_key)
         url = _aggregate_url(provider_symbol, request)
         params: dict[str, str | int] | None = {
-            'adjusted': 'true',
             'sort': 'asc',
             'limit': MASSIVE_PAGE_LIMIT,
         }
+        if self.supports_adjustment:
+            params['adjusted'] = (
+                'true' if request.adjustment_mode is AdjustmentMode.SPLIT_ADJUSTED else 'false'
+            )
         candles_by_timestamp: dict[int, HistoricalCandle] = {}
         visited_urls: set[str] = set()
 
@@ -101,7 +111,16 @@ class MassiveStocksProvider(HistoricalCandleProvider):
             visited_urls.add(url)
 
             payload = self._request_json(url, api_key, params)
-            page_candles = _normalize_page(payload, request, provider_symbol)
+            page_candles = _normalize_page(
+                payload,
+                request,
+                provider_symbol,
+                expected_adjusted=(
+                    request.adjustment_mode is AdjustmentMode.SPLIT_ADJUSTED
+                    if self.supports_adjustment
+                    else None
+                ),
+            )
             for candle in page_candles:
                 previous = candles_by_timestamp.get(candle.timestamp)
                 if previous is not None and previous != candle:
@@ -114,10 +133,74 @@ class MassiveStocksProvider(HistoricalCandleProvider):
             if next_url is None:
                 candles = tuple(candles_by_timestamp[timestamp] for timestamp in sorted(candles_by_timestamp))
                 return HistoricalCandleBatch(request, candles)
+            self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
             url = _validated_next_url(next_url)
             params = None
 
         raise ProviderPaginationError('Massive pagination exceeded the safety limit')
+
+    def search_symbols(self, query: str, limit: int = MASSIVE_TICKER_SEARCH_LIMIT) -> tuple[str, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MASSIVE_TICKER_SEARCH_LIMIT:
+            raise HistoricalDataRequestError(
+                f'Massive ticker search limit must be between 1 and {MASSIVE_TICKER_SEARCH_LIMIT}'
+            )
+        api_key = self._credential_loader()
+        params: dict[str, str | int] = {
+            'active': 'true',
+            'search': query.strip(),
+            'sort': 'ticker',
+            'order': 'asc',
+            'limit': limit,
+        }
+        if len(self.markets) == 1:
+            params['market'] = self.markets[0]
+        payload = self._request_json(MASSIVE_TICKERS_URL, api_key, params)
+        return _normalize_ticker_search(payload, self.markets, self._catalog_symbol)
+
+    def list_symbols(self) -> tuple[str, ...]:
+        api_key = self._credential_loader()
+        symbols = []
+        seen_symbols = set()
+        symbol_markets: dict[str, str] = {}
+        for market_index, market in enumerate(self.markets):
+            url = MASSIVE_TICKERS_URL
+            params: dict[str, str | int] | None = {
+                'market': market,
+                'active': 'true',
+                'sort': 'ticker',
+                'order': 'asc',
+                # Massive's 1,000-result maximum keeps complete catalog retrieval bounded.
+                'limit': 1_000,
+            }
+            visited_urls = set()
+            for _ in range(MASSIVE_MAX_PAGES):
+                if url in visited_urls:
+                    raise ProviderPaginationError('Massive returned a repeated ticker pagination URL')
+                visited_urls.add(url)
+                payload = self._request_json(url, api_key, params)
+                for symbol in _normalize_ticker_search(payload, self.markets, self._catalog_symbol):
+                    previous_market = symbol_markets.get(symbol)
+                    if previous_market is not None and previous_market != market:
+                        raise ProviderSchemaError(
+                            f'Massive Currencies exposes ambiguous Forex and Crypto symbol {symbol!r}'
+                        )
+                    if symbol not in seen_symbols:
+                        symbols.append(symbol)
+                        seen_symbols.add(symbol)
+                        symbol_markets[symbol] = market
+                next_url = payload.get('next_url')
+                if next_url is None:
+                    break
+                self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+                url = _validated_next_url(next_url)
+                params = None
+            else:
+                raise ProviderPaginationError('Massive ticker pagination exceeded the safety limit')
+            if market_index + 1 < len(self.markets):
+                self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+        if not symbols:
+            raise ProviderSchemaError(f'Massive returned an empty active-{",".join(self.markets)} catalog')
+        return tuple(sorted(symbols))
 
     def _request_json(
         self,
@@ -157,16 +240,310 @@ class MassiveStocksProvider(HistoricalCandleProvider):
 
         raise ProviderUnavailableError('Massive is currently unavailable')
 
+    def _provider_symbol(self, symbol: str, api_key: str) -> str:
+        raise NotImplementedError
 
-def _massive_symbol(symbol: str) -> str:
-    normalized_symbol = symbol.strip()
+    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+        raise NotImplementedError
+
+
+class MassiveStocksProvider(MassiveAggregatesProvider):
+    provider_id = exchanges.MASSIVE_STOCKS
+    markets = ('stocks',)
+    supports_adjustment = True
+    capabilities = ProviderCapabilities(
+        credential_validation=True,
+        ticker_search=True,
+        native_timeframes=('1m',),
+        adjustment_modes=(AdjustmentMode.SPLIT_ADJUSTED,),
+        max_candles_per_request=MASSIVE_PAGE_LIMIT,
+        request_delay_seconds=MASSIVE_REQUEST_DELAY_SECONDS,
+        default_adjustment_mode=AdjustmentMode.SPLIT_ADJUSTED,
+    )
+
+    def _provider_symbol(self, symbol: str, api_key: str) -> str:
+        return _strip_usd_quote(symbol)
+
+    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+        ticker = _catalog_ticker(result)
+        if ticker is None or '-' in ticker:
+            return None
+        return f'{ticker}-USD'
+
+
+class MassiveCurrenciesProvider(MassiveAggregatesProvider):
+    provider_id = exchanges.MASSIVE_CURRENCIES
+    markets = ('fx', 'crypto')
+    supports_adjustment = True
+    capabilities = ProviderCapabilities(
+        credential_validation=True,
+        ticker_search=True,
+        native_timeframes=('1m',),
+        max_candles_per_request=MASSIVE_PAGE_LIMIT,
+        request_delay_seconds=MASSIVE_REQUEST_DELAY_SECONDS,
+    )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._resolved_symbols: dict[str, str] = {}
+
+    def _provider_symbol(self, symbol: str, api_key: str) -> str:
+        joined_symbol = _joined_pair(symbol)
+        cached_symbol = self._resolved_symbols.get(joined_symbol)
+        if cached_symbol is not None:
+            return cached_symbol
+        provider_symbols = set()
+        for index, (market, provider_symbol) in enumerate((('fx', f'C:{joined_symbol}'), ('crypto', f'X:{joined_symbol}'))):
+            payload = self._request_json(
+                MASSIVE_TICKERS_URL,
+                api_key,
+                {
+                    'ticker': provider_symbol,
+                    'market': market,
+                    'active': 'true',
+                    'limit': 1,
+                },
+            )
+            provider_symbols.update(
+                ticker
+                for result in _ticker_results(payload, (market,))
+                if (ticker := _catalog_ticker(result)) == provider_symbol
+            )
+            if index == 0:
+                self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+        if len(provider_symbols) != 1:
+            raise ProviderSymbolNotFoundError(
+                f'Massive Currencies could not resolve {symbol!r} to one Forex or Crypto ticker'
+            )
+        provider_symbol = provider_symbols.pop()
+        self._resolved_symbols[joined_symbol] = provider_symbol
+        # The aggregate request follows immediately; preserve the entry-plan request interval.
+        self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+        return provider_symbol
+
+    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+        market = result.get('market')
+        return _catalog_pair(result, 'C:' if market == 'fx' else 'X:')
+
+
+class MassiveIndicesProvider(MassiveAggregatesProvider):
+    provider_id = exchanges.MASSIVE_INDICES
+    markets = ('indices',)
+    capabilities = ProviderCapabilities(
+        credential_validation=True,
+        ticker_search=True,
+        native_timeframes=('1m',),
+        max_candles_per_request=MASSIVE_PAGE_LIMIT,
+        request_delay_seconds=MASSIVE_REQUEST_DELAY_SECONDS,
+    )
+
+    def _provider_symbol(self, symbol: str, api_key: str) -> str:
+        return f'I:{_strip_usd_quote(symbol)}'
+
+    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+        ticker = _catalog_ticker(result)
+        if ticker is None or not ticker.startswith('I:'):
+            return None
+        ticker = ticker[2:]
+        return f'{ticker}-USD' if ticker and '-' not in ticker else None
+
+
+class MassiveFuturesProvider(MassiveAggregatesProvider):
+    """Fetch explicit-expiry futures contracts through Massive's Futures v1 API."""
+
+    provider_id = exchanges.MASSIVE_FUTURES
+    capabilities = ProviderCapabilities(
+        credential_validation=True,
+        ticker_search=True,
+        native_timeframes=('1m',),
+        max_candles_per_request=MASSIVE_PAGE_LIMIT,
+        request_delay_seconds=MASSIVE_REQUEST_DELAY_SECONDS,
+    )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._resolved_symbols: dict[str, str] = {}
+
+    def _fetch_candles(self, request: HistoricalCandleRequest) -> HistoricalCandleBatch:
+        if request.adjustment_mode is not AdjustmentMode.NONE:
+            raise HistoricalDataRequestError('Massive Futures requires unadjusted candles')
+        api_key = self._credential_loader()
+        provider_symbol = self._provider_symbol(request.symbol, api_key)
+        url = f'{MASSIVE_FUTURES_AGGREGATES_URL}/{quote(provider_symbol, safe="")}'
+        params: dict[str, str | int] | None = {
+            'resolution': '1min',
+            # Futures v1 accepts nanoseconds and comparison suffixes for an exact half-open range.
+            'window_start.gte': request.requested_range.start_timestamp * 1_000_000,
+            'window_start.lt': request.requested_range.end_timestamp * 1_000_000,
+            'sort': 'window_start.asc',
+            'limit': MASSIVE_PAGE_LIMIT,
+        }
+        candles_by_timestamp: dict[int, HistoricalCandle] = {}
+        visited_urls = set()
+
+        for _ in range(MASSIVE_MAX_PAGES):
+            if url in visited_urls:
+                raise ProviderPaginationError('Massive Futures returned a repeated aggregate pagination URL')
+            visited_urls.add(url)
+            payload = self._request_json(url, api_key, params)
+            for candle in _normalize_futures_page(payload, request, provider_symbol):
+                previous = candles_by_timestamp.get(candle.timestamp)
+                if previous is not None and previous != candle:
+                    raise ProviderPaginationError(
+                        f'Massive Futures returned conflicting candles for timestamp {candle.timestamp}'
+                    )
+                candles_by_timestamp[candle.timestamp] = candle
+            next_url = payload.get('next_url')
+            if next_url is None:
+                return HistoricalCandleBatch(
+                    request,
+                    tuple(candles_by_timestamp[timestamp] for timestamp in sorted(candles_by_timestamp)),
+                )
+            self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+            url = _validated_next_url(next_url)
+            params = None
+
+        raise ProviderPaginationError('Massive Futures aggregate pagination exceeded the safety limit')
+
+    def search_symbols(self, query: str, limit: int = MASSIVE_TICKER_SEARCH_LIMIT) -> tuple[str, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MASSIVE_TICKER_SEARCH_LIMIT:
+            raise HistoricalDataRequestError(
+                f'Massive Futures search limit must be between 1 and {MASSIVE_TICKER_SEARCH_LIMIT}'
+            )
+        normalized_query = query.strip().upper()
+        return tuple(symbol for symbol in self.list_symbols() if normalized_query in symbol)[:limit]
+
+    def list_symbols(self) -> tuple[str, ...]:
+        api_key = self._credential_loader()
+        product_currencies = self._load_product_currencies(api_key)
+        self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+        url = MASSIVE_FUTURES_CONTRACTS_URL
+        params: dict[str, str | int] | None = {
+            'type': 'single',
+            # Include contracts whose final trade date falls within the entry plan's two-year history.
+            'last_trade_date.gte': (datetime.now(timezone.utc) - timedelta(days=730)).date().isoformat(),
+            'sort': 'ticker.asc',
+            'limit': 1_000,
+        }
+        symbols = []
+        seen_symbols = set()
+        visited_urls = set()
+        for _ in range(MASSIVE_MAX_PAGES):
+            if url in visited_urls:
+                raise ProviderPaginationError('Massive Futures returned a repeated contract pagination URL')
+            visited_urls.add(url)
+            payload = self._request_json(url, api_key, params)
+            for symbol in _normalize_futures_contracts(payload, product_currencies):
+                if symbol not in seen_symbols:
+                    symbols.append(symbol)
+                    seen_symbols.add(symbol)
+            next_url = payload.get('next_url')
+            if next_url is None:
+                if not symbols:
+                    raise ProviderSchemaError('Massive Futures returned an empty active-contract catalog')
+                return tuple(symbols)
+            self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+            url = _validated_next_url(next_url)
+            params = None
+        raise ProviderPaginationError('Massive Futures contract pagination exceeded the safety limit')
+
+    def _load_product_currencies(self, api_key: str) -> dict[str, str]:
+        url = MASSIVE_FUTURES_PRODUCTS_URL
+        params: dict[str, str | int] | None = {
+            'type': 'single',
+            'sort': 'product_code.asc',
+            # The endpoint permits 50,000 products, normally making this a single request.
+            'limit': MASSIVE_PAGE_LIMIT,
+        }
+        currencies: dict[str, str] = {}
+        visited_urls = set()
+        for _ in range(MASSIVE_MAX_PAGES):
+            if url in visited_urls:
+                raise ProviderPaginationError('Massive Futures returned a repeated product pagination URL')
+            visited_urls.add(url)
+            payload = self._request_json(url, api_key, params)
+            for product_code, currency in _normalize_futures_products(payload):
+                previous = currencies.get(product_code)
+                if previous is not None and previous != currency:
+                    raise ProviderSchemaError(
+                        f'Massive Futures returned conflicting currencies for product {product_code!r}'
+                    )
+                currencies[product_code] = currency
+            next_url = payload.get('next_url')
+            if next_url is None:
+                if not currencies:
+                    raise ProviderSchemaError('Massive Futures returned an empty product catalog')
+                return currencies
+            self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+            url = _validated_next_url(next_url)
+            params = None
+        raise ProviderPaginationError('Massive Futures product pagination exceeded the safety limit')
+
+    def _provider_symbol(self, symbol: str, api_key: str) -> str:
+        normalized_symbol = symbol.strip().upper()
+        cached_symbol = self._resolved_symbols.get(normalized_symbol)
+        if cached_symbol is not None:
+            return cached_symbol
+        provider_symbol, quote_asset = _split_futures_symbol(normalized_symbol)
+        contract_payload = self._request_json(
+            MASSIVE_FUTURES_CONTRACTS_URL,
+            api_key,
+            {'ticker': provider_symbol, 'type': 'single', 'limit': 2},
+        )
+        contracts = [
+            result
+            for result in _successful_results(contract_payload, 'Futures contract')
+            if result.get('ticker') == provider_symbol and result.get('type') in (None, 'single')
+        ]
+        if len(contracts) != 1:
+            raise ProviderSymbolNotFoundError(f'Massive Futures could not resolve contract {provider_symbol!r}')
+        product_code = contracts[0].get('product_code')
+        if not isinstance(product_code, str) or not product_code.strip():
+            raise ProviderSchemaError('Massive Futures contracts require a product_code')
+        self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+        product_payload = self._request_json(
+            MASSIVE_FUTURES_PRODUCTS_URL,
+            api_key,
+            {'product_code': product_code, 'limit': 2},
+        )
+        products = _normalize_futures_products(product_payload)
+        matching_currencies = {currency for code, currency in products if code == product_code.upper()}
+        if matching_currencies != {quote_asset}:
+            raise ProviderSymbolNotFoundError(
+                f'Massive Futures contract {provider_symbol!r} does not use currency {quote_asset!r}'
+            )
+        self._resolved_symbols[normalized_symbol] = provider_symbol
+        self._sleep(MASSIVE_REQUEST_DELAY_SECONDS)
+        return provider_symbol
+
+    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+        raise NotImplementedError
+
+
+def _strip_usd_quote(symbol: str) -> str:
+    normalized_symbol = symbol.strip().upper()
     if normalized_symbol.endswith('-USD'):
         normalized_symbol = normalized_symbol[:-4]
     elif '-' in normalized_symbol:
-        raise HistoricalDataRequestError('Massive stock symbols must be direct tickers or use the -USD quote')
+        raise HistoricalDataRequestError('Massive symbols must be direct tickers or use the -USD quote')
     if not normalized_symbol:
-        raise HistoricalDataRequestError('Massive stock ticker must not be empty')
+        raise HistoricalDataRequestError('Massive ticker must not be empty')
     return normalized_symbol
+
+
+def _split_futures_symbol(symbol: str) -> tuple[str, str]:
+    normalized_symbol = symbol.strip().upper()
+    provider_symbol, separator, quote_asset = normalized_symbol.rpartition('-')
+    if not separator or not provider_symbol or not quote_asset:
+        raise HistoricalDataRequestError('Massive Futures symbols must use the CONTRACT-CURRENCY format')
+    return provider_symbol, quote_asset
+
+
+def _joined_pair(symbol: str) -> str:
+    assets = symbol.strip().upper().split('-')
+    if len(assets) != 2 or not all(assets):
+        raise HistoricalDataRequestError('Massive currency symbols must use the BASE-QUOTE format')
+    return ''.join(assets)
 
 
 def _aggregate_url(provider_symbol: str, request: HistoricalCandleRequest) -> str:
@@ -214,9 +591,9 @@ def _response_error(status_code: int, payload: Mapping[str, Any]) -> Exception |
     if status_code == 401:
         return ProviderAuthenticationError('Massive rejected the API key')
     if status_code == 403:
-        return ProviderEntitlementError('The API key cannot access the requested Massive stock data')
+        return ProviderEntitlementError('The API key cannot access the requested Massive data')
     if status_code == 404:
-        return ProviderSymbolNotFoundError('Massive could not find the requested stock ticker')
+        return ProviderSymbolNotFoundError('Massive could not find the requested ticker')
     if status_code == 429:
         if 'quota' in message:
             return ProviderQuotaError('Massive request quota is exhausted')
@@ -240,10 +617,67 @@ def _provider_error_message(payload: Mapping[str, Any]) -> str:
     return ''
 
 
+def _normalize_ticker_search(
+    payload: Mapping[str, Any],
+    expected_markets: tuple[str, ...],
+    symbol_formatter: Callable[[Mapping[str, Any]], str | None],
+) -> tuple[str, ...]:
+    symbols = []
+    seen = set()
+    for result in _ticker_results(payload, expected_markets):
+        symbol = symbol_formatter(result)
+        if symbol is None:
+            continue
+        if symbol not in seen:
+            symbols.append(symbol)
+            seen.add(symbol)
+    return tuple(symbols)
+
+
+def _ticker_results(payload: Mapping[str, Any], expected_markets: tuple[str, ...]) -> tuple[Mapping[str, Any], ...]:
+    status = payload.get('status')
+    if status is not None and status != 'OK':
+        raise ProviderSchemaError('Massive returned an unsuccessful ticker-search payload')
+    results = payload.get('results', [])
+    if not isinstance(results, list):
+        raise ProviderSchemaError('Massive ticker-search results must be an array')
+    normalized_results = []
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise ProviderSchemaError('Massive ticker-search entries must be objects')
+        # Enforce product boundaries even if a pagination response loses the original market filter.
+        if result.get('market') in expected_markets:
+            normalized_results.append(result)
+    return tuple(normalized_results)
+
+
+def _catalog_ticker(result: Mapping[str, Any]) -> str | None:
+    ticker = result.get('ticker')
+    if not isinstance(ticker, str) or not ticker.strip():
+        raise ProviderSchemaError('Massive ticker-search entries require a ticker')
+    return ticker.strip().upper()
+
+
+def _catalog_pair(result: Mapping[str, Any], provider_prefix: str) -> str | None:
+    ticker = _catalog_ticker(result)
+    base = result.get('base_currency_symbol')
+    quote_asset = result.get('currency_symbol')
+    if not isinstance(base, str) or not isinstance(quote_asset, str):
+        return None
+    base = base.strip().upper()
+    quote_asset = quote_asset.strip().upper()
+    if not base or not quote_asset or '-' in base or '-' in quote_asset:
+        return None
+    if ticker != f'{provider_prefix}{base}{quote_asset}':
+        return None
+    return f'{base}-{quote_asset}'
+
+
 def _normalize_page(
     payload: Mapping[str, Any],
     request: HistoricalCandleRequest,
     provider_symbol: str,
+    expected_adjusted: bool | None,
 ) -> tuple[HistoricalCandle, ...]:
     status = payload.get('status')
     if status is not None and status != 'OK':
@@ -252,7 +686,7 @@ def _normalize_page(
     if ticker is not None and ticker != provider_symbol:
         raise ProviderSchemaError('Massive returned candles for an unexpected ticker')
     adjusted = payload.get('adjusted')
-    if adjusted is not None and adjusted is not True:
+    if expected_adjusted is not None and adjusted is not None and adjusted is not expected_adjusted:
         raise ProviderSchemaError('Massive returned candles with an unexpected adjustment mode')
 
     results = payload.get('results', [])
@@ -276,7 +710,8 @@ def _normalize_page(
                     high=float(row['h']),
                     low=float(row['l']),
                     close=float(row['c']),
-                    volume=float(row['v']),
+                    # Index values have no volume field; zero records that provider-level absence.
+                    volume=float(row.get('v', 0)),
                     vwap=float(row['vw']) if row.get('vw') is not None else None,
                     transaction_count=(
                         _strict_int(row['n'], 'transaction_count') if row.get('n') is not None else None
@@ -292,6 +727,113 @@ def _normalize_page(
     if any(current.timestamp <= previous.timestamp for previous, current in zip(candles, candles[1:])):
         raise ProviderSchemaError('Massive candle timestamps must be ascending and unique within a page')
     return candles
+
+
+def _normalize_futures_products(payload: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    results = _successful_results(payload, 'Futures product')
+    products = []
+    for result in results:
+        product_code = result.get('product_code')
+        currency = result.get('trade_currency_code') or result.get('settlement_currency_code')
+        if not isinstance(product_code, str) or not product_code.strip():
+            raise ProviderSchemaError('Massive Futures products require a product_code')
+        if not isinstance(currency, str) or not currency.strip():
+            raise ProviderSchemaError('Massive Futures products require a trade or settlement currency')
+        product_code = product_code.strip().upper()
+        currency = currency.strip().upper()
+        if '-' in product_code or '-' in currency:
+            raise ProviderSchemaError('Massive Futures product codes and currencies cannot contain dashes')
+        products.append((product_code, currency))
+    return tuple(products)
+
+
+def _normalize_futures_contracts(
+    payload: Mapping[str, Any],
+    product_currencies: Mapping[str, str],
+) -> tuple[str, ...]:
+    results = _successful_results(payload, 'Futures contract')
+    symbols = []
+    for result in results:
+        ticker = result.get('ticker')
+        product_code = result.get('product_code')
+        if not isinstance(ticker, str) or not ticker.strip():
+            raise ProviderSchemaError('Massive Futures contracts require a ticker')
+        if not isinstance(product_code, str) or not product_code.strip():
+            raise ProviderSchemaError('Massive Futures contracts require a product_code')
+        if result.get('type') not in (None, 'single'):
+            continue
+        ticker = ticker.strip().upper()
+        product_code = product_code.strip().upper()
+        currency = product_currencies.get(product_code)
+        if currency is None:
+            raise ProviderSchemaError(
+                f'Massive Futures contract {ticker!r} references unknown product {product_code!r}'
+            )
+        if '-' in ticker:
+            raise ProviderSchemaError('Massive Futures contract tickers cannot contain dashes')
+        symbols.append(f'{ticker}-{currency}')
+    return tuple(symbols)
+
+
+def _normalize_futures_page(
+    payload: Mapping[str, Any],
+    request: HistoricalCandleRequest,
+    provider_symbol: str,
+) -> tuple[HistoricalCandle, ...]:
+    results = _successful_results(payload, 'Futures candle')
+    candles = []
+    try:
+        for result in results:
+            ticker = result.get('ticker')
+            if ticker is not None and ticker != provider_symbol:
+                raise ProviderSchemaError('Massive Futures returned candles for an unexpected ticker')
+            timestamp_ns = _strict_int(result['window_start'], 'window_start')
+            if timestamp_ns % 1_000_000 != 0:
+                raise ProviderSchemaError('Massive Futures window_start must resolve to whole milliseconds')
+            timestamp = timestamp_ns // 1_000_000
+            if not request.requested_range.start_timestamp <= timestamp < request.requested_range.end_timestamp:
+                continue
+            volume = float(result['volume'])
+            dollar_volume = result.get('dollar_volume')
+            candles.append(
+                HistoricalCandle(
+                    timestamp=timestamp,
+                    open=float(result['open']),
+                    high=float(result['high']),
+                    low=float(result['low']),
+                    close=float(result['close']),
+                    volume=volume,
+                    vwap=float(dollar_volume) / volume if dollar_volume is not None and volume > 0 else None,
+                    transaction_count=(
+                        _strict_int(result['transactions'], 'transactions')
+                        if result.get('transactions') is not None
+                        else None
+                    ),
+                )
+            )
+    except ProviderSchemaError:
+        raise
+    except (HistoricalCandleValidationError, KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+        raise ProviderSchemaError('Massive Futures returned an invalid candle payload') from exc
+    normalized_candles = tuple(candles)
+    if any(
+        current.timestamp <= previous.timestamp
+        for previous, current in zip(normalized_candles, normalized_candles[1:])
+    ):
+        raise ProviderSchemaError('Massive Futures candle timestamps must be ascending and unique within a page')
+    return normalized_candles
+
+
+def _successful_results(payload: Mapping[str, Any], label: str) -> tuple[Mapping[str, Any], ...]:
+    status = payload.get('status')
+    if status is not None and status != 'OK':
+        raise ProviderSchemaError(f'Massive returned an unsuccessful {label.lower()} payload')
+    results = payload.get('results', [])
+    if not isinstance(results, list):
+        raise ProviderSchemaError(f'Massive {label.lower()} results must be an array')
+    if any(not isinstance(result, Mapping) for result in results):
+        raise ProviderSchemaError(f'Massive {label.lower()} entries must be objects')
+    return tuple(results)
 
 
 def _strict_int(value: Any, field: str) -> int:

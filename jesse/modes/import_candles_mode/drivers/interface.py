@@ -24,7 +24,11 @@ class CandleExchange(HistoricalCandleProvider, ABC):
         self.name = name
         self.provider_id = name
         # Crypto persistence imports native 1m bars and derives larger timeframes later.
-        self.capabilities = ProviderCapabilities(native_timeframes=('1m',))
+        self.capabilities = ProviderCapabilities(
+            native_timeframes=('1m',),
+            max_candles_per_request=count,
+            request_delay_seconds=1 / rate_limit_per_second,
+        )
         self.count = count
         self.sleep_time = 1 / rate_limit_per_second
         self._backup_exchange_class = backup_exchange_class
@@ -83,23 +87,36 @@ class CandleExchange(HistoricalCandleProvider, ABC):
             raise ProviderSchemaError(str(exc)) from exc
 
         try:
+            normalized_rows = tuple((int(row['timestamp']), row) for row in rows)
             candles = tuple(
                 HistoricalCandle(
-                    timestamp=int(row['timestamp']),
+                    timestamp=timestamp,
                     open=float(row['open']),
                     high=float(row['high']),
                     low=float(row['low']),
                     close=float(row['close']),
                     volume=float(row['volume']),
                 )
-                for row in rows
-                if request.requested_range.start_timestamp <= int(row['timestamp']) < page_end
+                for timestamp, row in normalized_rows
+                if request.requested_range.start_timestamp <= timestamp < page_end
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProviderSchemaError(f'Invalid candle payload from {self.provider_id}: {exc}') from exc
 
         continuation_token = str(page_end) if page_end < request.requested_range.end_timestamp else None
-        return HistoricalCandleBatch(request, candles, continuation_token)
+        future_timestamps = tuple(timestamp for timestamp, _ in normalized_rows if timestamp >= page_end)
+        # Some crypto APIs ignore unavailable old ranges and return their first real later candle.
+        next_available_timestamp = min(future_timestamps) if not candles and future_timestamps else None
+        return HistoricalCandleBatch(
+            request,
+            candles,
+            continuation_token=continuation_token,
+            next_available_timestamp=next_available_timestamp,
+        )
+
+    def list_symbols(self) -> tuple[str, ...]:
+        """Expose legacy exchange discovery through the shared historical-provider contract."""
+        return tuple(self.get_available_symbols())
 
     @abstractmethod
     def get_starting_time(self, symbol: str) -> int:

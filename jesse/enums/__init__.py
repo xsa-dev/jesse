@@ -66,6 +66,9 @@ class order_types:
 class exchanges:
     SANDBOX = 'Sandbox'
     MASSIVE_STOCKS = 'Massive Stocks'
+    MASSIVE_CURRENCIES = 'Massive Currencies'
+    MASSIVE_INDICES = 'Massive Indices'
+    MASSIVE_FUTURES = 'Massive Futures'
     COINBASE_SPOT = 'Coinbase Spot'
     BITFINEX_SPOT = 'Bitfinex Spot'
     BINANCE_SPOT = 'Binance Spot'

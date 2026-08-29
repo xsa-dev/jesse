@@ -8,14 +8,17 @@ from typing import Any, TypeVar
 
 from jesse.constants import TIMEFRAME_TO_ONE_MINUTES
 
-from .errors import HistoricalCandleValidationError, HistoricalDataRequestError
+from .errors import HistoricalCandleValidationError, HistoricalDataRequestError, ProviderCapabilityError
 
 
 class AssetClass(str, Enum):
     CRYPTO = 'crypto'
+    CURRENCY = 'currency'
     EQUITY = 'equity'
     FX = 'fx'
     COMMODITY = 'commodity'
+    INDEX = 'index'
+    FUTURES = 'futures'
 
 
 class InstrumentType(str, Enum):
@@ -24,6 +27,7 @@ class InstrumentType(str, Enum):
     ETF = 'etf'
     PERPETUAL = 'perpetual'
     FUTURES_CONTRACT = 'futures_contract'
+    INDEX = 'index'
 
 
 class HistoricalDataSourceType(str, Enum):
@@ -122,12 +126,20 @@ class ProviderCapabilities:
     ticker_search: bool = False
     native_timeframes: tuple[str, ...] = ('1m',)
     adjustment_modes: tuple[AdjustmentMode, ...] = ()
+    max_candles_per_request: int | None = None
+    request_delay_seconds: float = 0.0
+    default_adjustment_mode: AdjustmentMode = AdjustmentMode.NONE
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
             'adjustment_modes',
             tuple(_coerce_enum(AdjustmentMode, value, 'adjustment_mode') for value in self.adjustment_modes),
+        )
+        object.__setattr__(
+            self,
+            'default_adjustment_mode',
+            _coerce_enum(AdjustmentMode, self.default_adjustment_mode, 'default_adjustment_mode'),
         )
         if not self.native_timeframes:
             raise HistoricalDataRequestError('A candle provider must expose at least one native timeframe')
@@ -140,6 +152,27 @@ class ProviderCapabilities:
             raise HistoricalDataRequestError('native_timeframes must be unique')
         if len(set(self.adjustment_modes)) != len(self.adjustment_modes):
             raise HistoricalDataRequestError('adjustment_modes must be unique')
+        if (
+            self.max_candles_per_request is not None
+            and (
+                isinstance(self.max_candles_per_request, bool)
+                or not isinstance(self.max_candles_per_request, int)
+                or self.max_candles_per_request <= 0
+            )
+        ):
+            raise HistoricalDataRequestError('max_candles_per_request must be a positive integer')
+        if (
+            isinstance(self.request_delay_seconds, bool)
+            or not isinstance(self.request_delay_seconds, Real)
+            or not isfinite(float(self.request_delay_seconds))
+            or self.request_delay_seconds < 0
+        ):
+            raise HistoricalDataRequestError('request_delay_seconds must be a finite nonnegative number')
+        if (
+            self.default_adjustment_mode is not AdjustmentMode.NONE
+            and self.default_adjustment_mode not in self.adjustment_modes
+        ):
+            raise HistoricalDataRequestError('default_adjustment_mode must be supported by the provider')
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +199,7 @@ class HistoricalCandleBatch:
     request: HistoricalCandleRequest
     candles: tuple[HistoricalCandle, ...]
     continuation_token: str | None = None
+    next_available_timestamp: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'candles', tuple(self.candles))
@@ -189,6 +223,21 @@ class HistoricalCandleBatch:
             previous_timestamp = candle.timestamp
         if self.continuation_token is not None and not self.continuation_token:
             raise HistoricalDataRequestError('continuation_token must be non-empty when provided')
+        if self.next_available_timestamp is not None:
+            if self.candles:
+                raise HistoricalCandleValidationError(
+                    'next_available_timestamp is only valid when the requested range returned no candles'
+                )
+            _validate_timestamp(self.next_available_timestamp, 'next_available_timestamp')
+            if self.next_available_timestamp % interval != 0:
+                raise HistoricalCandleValidationError(
+                    f'Next available timestamp {self.next_available_timestamp} is not aligned to '
+                    f'{self.request.timeframe}'
+                )
+            if self.next_available_timestamp < self.request.requested_range.end_timestamp:
+                raise HistoricalCandleValidationError(
+                    'next_available_timestamp must be at or after the requested range'
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +363,14 @@ class HistoricalCandleProvider(ABC):
         if batch.request != request:
             raise HistoricalCandleValidationError('Provider batch request must match the submitted request')
         return batch
+
+    def search_symbols(self, query: str, limit: int = 50) -> tuple[str, ...]:
+        """Search provider symbols when the provider advertises ticker-search support."""
+        raise ProviderCapabilityError(f'Provider {self.provider_id!r} does not support ticker search')
+
+    def list_symbols(self) -> tuple[str, ...]:
+        """List provider symbols when the provider advertises ticker-search support."""
+        raise ProviderCapabilityError(f'Provider {self.provider_id!r} does not support symbol discovery')
 
     @abstractmethod
     def _fetch_candles(self, request: HistoricalCandleRequest) -> HistoricalCandleBatch:

@@ -234,11 +234,25 @@ def get_candles_from_db(
     # if warmup_candles is set, calculate the warmup start and finish timestamps
     if warmup_candles_num > 0:
         warmup_finish_timestamp = trading_start_date_timestamp
-        warmup_start_timestamp = warmup_finish_timestamp - (
-                warmup_candles_num * jh.timeframe_to_one_minutes(timeframe) * 60_000)
-        warmup_finish_timestamp -= 60_000
-        warmup_candles = _get_candles_from_db(exchange, symbol, warmup_start_timestamp, warmup_finish_timestamp,
-                                              caching=caching)
+        if timeframe == '1m':
+            warmup_candles = _get_observed_warmup_candles_from_db(
+                exchange,
+                symbol,
+                warmup_finish_timestamp,
+                warmup_candles_num,
+                caching=caching,
+            )
+        else:
+            warmup_start_timestamp = warmup_finish_timestamp - (
+                    warmup_candles_num * jh.timeframe_to_one_minutes(timeframe) * 60_000)
+            warmup_finish_timestamp -= 60_000
+            warmup_candles = _get_candles_from_db(
+                exchange,
+                symbol,
+                warmup_start_timestamp,
+                warmup_finish_timestamp,
+                caching=caching,
+            )
     else:
         warmup_candles = None
 
@@ -308,35 +322,69 @@ def _get_candles_from_db(
     # Convert to numpy array for easier timestamp extraction
     candles_array = np.array(candles_tuple)
     
-    # Verify the retrieved data covers the requested range
-    if len(candles_array) > 0:
-        earliest_available = candles_array[0][0]  # First timestamp
-        latest_available = candles_array[-1][0]   # Last timestamp
-        
-        # Check if earliest available timestamp is after the requested start date
-        if earliest_available > start_date_timestamp + 60_000:  # Allow 1 minute tolerance
-            raise CandleNotFoundInDatabase(
-                f"Missing candles for {symbol} on {exchange}. "
-                f"Requested data from {jh.timestamp_to_date(start_date_timestamp)}, "
-                f"but earliest available candle is from {jh.timestamp_to_date(earliest_available)}."
-            )
-            
-        # For finish date validation, we need to check if we have candles up to exactly one minute
-        # before the start of the requested finish date
-        # Check if the latest available candle timestamp is before the required last candle
-        if latest_available < finish_date_timestamp:
-            # Missing candles at the end of the requested range
-            raise CandleNotFoundInDatabase(
-                f"Missing recent candles for \"{symbol}\" on \"{exchange}\". "
-                f"Requested data until \"{jh.timestamp_to_time(finish_date_timestamp)[:19]}\", "
-                f"but latest available candle is up to \"{jh.timestamp_to_time(latest_available)[:19]}\"."
-            )
-
     if caching:
         # cache for 1 week it for near future calls
         cache.set_value(cache_key, candles_tuple, expire_seconds=60 * 60 * 24 * 7)
 
     return candles_array
+
+
+def _get_observed_warmup_candles_from_db(
+        exchange: str,
+        symbol: str,
+        trading_start_timestamp: int,
+        candle_count: int,
+        caching: bool = False,
+) -> np.ndarray:
+    """Load the latest observed 1m rows so sparse closures do not reduce indicator warmup."""
+    from jesse.models.Candle import Candle
+    from jesse.services.cache import cache
+
+    cache_key = f'observed-warmup-{trading_start_timestamp}-{candle_count}-{jh.key(exchange, symbol)}'
+    if caching:
+        cached_value = cache.get_value(cache_key)
+        if cached_value:
+            return np.array(cached_value)
+
+    candles_tuple = list(
+        Candle.select(
+            Candle.timestamp,
+            Candle.open,
+            Candle.close,
+            Candle.high,
+            Candle.low,
+            Candle.volume,
+        )
+        .where(
+            Candle.exchange == exchange,
+            Candle.symbol == symbol,
+            (Candle.timeframe == '1m') | Candle.timeframe.is_null(),
+            Candle.timestamp < trading_start_timestamp,
+        )
+        .order_by(Candle.timestamp.desc())
+        .limit(candle_count)
+        .tuples()
+    )
+    if len(candles_tuple) < candle_count:
+        raise CandleNotFoundInDatabase(
+            f'Only {len(candles_tuple)} of {candle_count} required observed warmup candles were found '
+            f'for {symbol} on {exchange} before {jh.timestamp_to_date(trading_start_timestamp)}.'
+        )
+    candles_tuple.reverse()
+    if caching:
+        cache.set_value(cache_key, candles_tuple, expire_seconds=60 * 60 * 24 * 7)
+    return np.array(candles_tuple)
+
+
+def validate_observed_one_minute_candles(candles: np.ndarray, exchange: str, symbol: str) -> None:
+    """Validate observed 1m rows without requiring candles at absent timestamps or range edges."""
+    if not isinstance(candles, np.ndarray) or candles.ndim != 2 or candles.shape[1] != 6 or len(candles) == 0:
+        raise ValueError(f'Candles for {symbol} on {exchange} must be a nonempty six-column array.')
+    timestamps = candles[:, 0]
+    if not np.isfinite(timestamps).all() or (timestamps % 60_000 != 0).any():
+        raise ValueError(f'Candles for {symbol} on {exchange} must have minute-aligned timestamps.')
+    if len(timestamps) > 1 and (np.diff(timestamps) <= 0).any():
+        raise ValueError(f'Candles for {symbol} on {exchange} must have strictly increasing unique timestamps.')
 
 
 def _get_generated_candles(timeframe, trading_candles) -> np.ndarray:

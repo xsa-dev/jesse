@@ -14,57 +14,39 @@ from jesse.store import store
 import jesse.helpers as jh 
 
 
-def _validate_contiguous_one_minute_candles(candles: dict) -> None:
-    """Validate the complete 1m source timeline required by research backtests.
-
-    Route timeframes may be higher than 1m, but Jesse generates those candles
-    from the supplied 1m data later in the simulation. Accepting an incomplete
-    source timeline would therefore make aggregation and execution mode-dependent.
-    """
-    # Jesse candle timestamps are milliseconds, so adjacent source candles must
-    # always be exactly 60 seconds apart regardless of the route timeframe.
-    one_minute_ms = 60_000
-
+def _validate_observed_one_minute_candles(candles: dict) -> None:
+    """Validate provider-observed source rows before mutating research runtime state."""
+    if not candles:
+        raise ValueError('At least one observed candle series is required.')
     for candle_data in candles.values():
-        candle_set = candle_data['candles']
-        exchange = candle_data['exchange']
-        symbol = candle_data['symbol']
+        candle_service.validate_observed_one_minute_candles(
+            candle_data['candles'],
+            candle_data['exchange'],
+            candle_data['symbol'],
+        )
 
-        if len(candle_set) < 2:
-            raise ValueError(
-                f'At least two continuous 1m candles are required for {symbol} on {exchange}.'
-            )
 
-        # Inspect every adjacent pair so a gap anywhere in the source timeline
-        # is rejected before higher-timeframe candles are generated.
-        timestamp_differences = np.diff(candle_set[:, 0])
-        invalid_indices = np.flatnonzero(timestamp_differences != one_minute_ms)
+def _validate_contiguous_one_minute_candles(candles: dict) -> None:
+    """Retain dense-only validation for research engines not yet migrated to timestamp replay."""
+    _validate_observed_one_minute_candles(candles)
+    for candle_data in candles.values():
+        differences = np.diff(candle_data['candles'][:, 0])
+        invalid_indices = np.flatnonzero(differences != 60_000)
         if len(invalid_indices) == 0:
             continue
-
-        # Report the first broken interval so the caller gets a deterministic,
-        # actionable location even when the provider response has multiple gaps.
-        previous_index = int(invalid_indices[0])
-        previous_timestamp = int(candle_set[previous_index][0])
-        actual_timestamp = int(candle_set[previous_index + 1][0])
-        expected_timestamp = previous_timestamp + one_minute_ms
+        index = int(invalid_indices[0])
+        previous_timestamp = int(candle_data['candles'][index, 0])
+        actual_timestamp = int(candle_data['candles'][index + 1, 0])
         difference = actual_timestamp - previous_timestamp
-
-        # A forward, minute-aligned jump represents absent 1m rows. Duplicates,
-        # reversed rows, and non-minute-aligned timestamps use the generic error.
-        if difference > one_minute_ms and difference % one_minute_ms == 0:
-            missing_count = difference // one_minute_ms - 1
+        if difference > 60_000 and difference % 60_000 == 0:
+            missing_count = difference // 60_000 - 1
             candle_word = 'candle' if missing_count == 1 else 'candles'
             raise ValueError(
-                f'Missing {missing_count} one-minute {candle_word} for {symbol} on {exchange}. '
-                f'Expected timestamp {expected_timestamp} after {previous_timestamp}, '
-                f'but got {actual_timestamp}.'
+                f'Missing {missing_count} one-minute {candle_word} for '
+                f"{candle_data['symbol']} on {candle_data['exchange']}."
             )
-
         raise ValueError(
-            f'Candles for {symbol} on {exchange} must have strictly increasing '
-            f'1m timestamps. Expected {expected_timestamp} after {previous_timestamp}, '
-            f'but got {actual_timestamp}.'
+            f"Candles for {candle_data['symbol']} on {candle_data['exchange']} must be continuous 1m rows."
         )
 
 
@@ -172,10 +154,8 @@ def _isolated_backtest(
         candles_pipeline_kwargs: dict = None,
         generate_charts: bool = False,
 ) -> dict:
-    # Research backtests require complete 1m source data. Running validation
-    # before configuration, routes, or stores are mutated guarantees that fast
-    # and step simulation reject malformed input identically without leaked state.
-    _validate_contiguous_one_minute_candles(candles)
+    # Validate before configuration, routes, or stores are mutated so both execution modes fail identically.
+    _validate_observed_one_minute_candles(candles)
 
     _reset_research_runtime_state()
     try:
