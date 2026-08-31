@@ -12,9 +12,12 @@ class CandlesState:
         self.storage = {}
         self.are_all_initiated = False
         self.initiated_pairs = {}
-        # Sparse single-instrument replay derives forming candles from clock
-        # buckets; live and pre-M4C multi-instrument paths retain row-count behavior.
+        # Historical timestamp replay derives forming candles from clock buckets;
+        # live mode leaves this disabled and retains its streaming behavior.
         self.uses_timestamp_buckets = False
+        # Direct simulator fixtures may omit warmup. Production loaders and
+        # research requests enable this before enforcing configured route counts.
+        self.enforce_warmup = False
 
     def mark_all_as_initiated(self) -> None:
         for k in self.initiated_pairs:
@@ -41,7 +44,6 @@ class CandlesState:
                 # ex: 1440 / 60 + 1 (reserve one for forming candle)
                 total_bigger_timeframe = int((bucket_size / jh.timeframe_to_one_minutes(timeframe)) + 1)
                 self.storage[key] = DynamicNumpyArray((total_bigger_timeframe, 6))
-
 
     def forming_estimation(self, exchange: str, symbol: str, timeframe: str) -> tuple:
         # inline jh.key() — this is on the hot path of every indicator call

@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import jesse.helpers as jh
+from jesse import research
 from jesse import exceptions
 from jesse.config import reset_config
 from jesse.enums import exchanges, timeframes, order_types
@@ -148,6 +149,133 @@ def test_sparse_timestamp_routes_are_clock_aligned_and_atomic(fast_mode: bool):
         '000', False, {}, exchanges.SANDBOX, routes, data_routes,
         '2019-04-01', '2019-04-02', candles, fast_mode=fast_mode,
     )
+
+
+@pytest.mark.parametrize('fast_mode', [False, True], ids=['step', 'fast'])
+def test_thirteen_missing_minutes_preserve_nonempty_clock_buckets(fast_mode: bool):
+    set_up()
+    start = 1_704_067_200_000
+    # Minutes 01 through 13 are absent, spanning the rest of 00:00, all of
+    # 00:05, and most of 00:10 without manufacturing any source observations.
+    candles_array = np.array([
+        [start, 10, 11, 12, 9, 1],
+        [start + 14 * 60_000, 24, 25, 26, 23, 15],
+    ], dtype=np.float64)
+    candles = {
+        jh.key(exchanges.SANDBOX, 'BTC-USDT'): {
+            'exchange': exchanges.SANDBOX,
+            'symbol': 'BTC-USDT',
+            'candles': candles_array,
+        },
+    }
+    routes = [
+        {'symbol': 'BTC-USDT', 'timeframe': '5m', 'strategy': 'TestLongSparseGap'},
+    ]
+
+    backtest_mode.run(
+        '000', False, {}, exchanges.SANDBOX, routes, [],
+        '2019-04-01', '2019-04-02', candles, fast_mode=fast_mode,
+    )
+
+
+@pytest.mark.parametrize('reverse_order', [False, True], ids=['forward', 'reversed'])
+def test_multi_instrument_replay_uses_union_events_and_ignores_stale_orders(reverse_order: bool):
+    set_up()
+    start = 1_704_067_200_000
+    btc = np.array([
+        [start + minute * 60_000, 10 + minute, 10 + minute, 10 + minute, 10 + minute, 1]
+        for minute in [0, 1, 2, 3]
+    ], dtype=np.float64)
+    eth = np.array([
+        [start + minute * 60_000, 100 + minute, 100 + minute, 100 + minute, 100 + minute, 1]
+        for minute in [0, 2, 3]
+    ], dtype=np.float64)
+    routes = [
+        {'symbol': 'BTC-USDT', 'timeframe': '1m', 'strategy': 'TestMultiInstrumentReplayA'},
+        {'symbol': 'ETH-USDT', 'timeframe': '1m', 'strategy': 'TestMultiInstrumentReplayB'},
+    ]
+    candle_items = [
+        (jh.key(exchanges.SANDBOX, 'BTC-USDT'), {
+            'exchange': exchanges.SANDBOX, 'symbol': 'BTC-USDT', 'candles': btc,
+        }),
+        (jh.key(exchanges.SANDBOX, 'ETH-USDT'), {
+            'exchange': exchanges.SANDBOX, 'symbol': 'ETH-USDT', 'candles': eth,
+        }),
+    ]
+    if reverse_order:
+        routes.reverse()
+        candle_items.reverse()
+
+    backtest_mode.run(
+        '000', False, {}, exchanges.SANDBOX, routes, [],
+        '2019-04-01', '2019-04-02', dict(candle_items),
+    )
+
+
+def test_multi_instrument_replay_rejects_streams_without_a_shared_trading_period():
+    set_up()
+    start = 1_704_067_200_000
+    routes = [
+        {'symbol': 'BTC-USDT', 'timeframe': '1m', 'strategy': 'TestEmptyStrategy'},
+        {'symbol': 'ETH-USDT', 'timeframe': '1m', 'strategy': 'TestEmptyStrategy'},
+    ]
+    candles = {
+        jh.key(exchanges.SANDBOX, 'BTC-USDT'): {
+            'exchange': exchanges.SANDBOX,
+            'symbol': 'BTC-USDT',
+            'candles': np.array([[start, 10, 10, 10, 10, 1]], dtype=np.float64),
+        },
+        jh.key(exchanges.SANDBOX, 'ETH-USDT'): {
+            'exchange': exchanges.SANDBOX,
+            'symbol': 'ETH-USDT',
+            'candles': np.array([[start + 120_000, 20, 20, 20, 20, 1]], dtype=np.float64),
+        },
+    }
+
+    with pytest.raises(exceptions.CandlesNotFound, match='No trading candle remains for BTC-USDT'):
+        backtest_mode.run(
+            '000', False, {}, exchanges.SANDBOX, routes, [],
+            '2019-04-01', '2019-04-02', candles,
+        )
+
+
+def test_research_uses_one_warmup_safe_start_for_trading_and_data_routes():
+    start = 1_704_067_200_000
+    exchange = 'Warmup Exchange'
+
+    def _candles(symbol: str, first_minute: int) -> dict:
+        # BTC omits one interior minute from each trading 5m bucket. ETH stays
+        # contiguous so both routes still share the real 5m closing events.
+        missing_minutes = {32, 37} if symbol == 'BTC-USDT' else set()
+        rows = np.array([
+            [start + minute * 60_000, 100 + minute, 100 + minute, 101 + minute, 99 + minute, 1]
+            for minute in range(first_minute, 41)
+            if minute not in missing_minutes
+        ], dtype=np.float64)
+        return {'exchange': exchange, 'symbol': symbol, 'candles': rows}
+
+    config_input = {
+        'starting_balance': 10_000,
+        'fee': 0,
+        'type': 'futures',
+        'futures_leverage': 1,
+        'futures_leverage_mode': 'cross',
+        'exchange': exchange,
+        'warm_up_candles': 2,
+    }
+    routes = [
+        {'exchange': exchange, 'symbol': 'BTC-USDT', 'timeframe': '5m', 'strategy': 'TestCommonWarmupStart'},
+        {'exchange': exchange, 'symbol': 'ETH-USDT', 'timeframe': '5m', 'strategy': 'TestCommonWarmupStart'},
+    ]
+    data_routes = [
+        {'exchange': exchange, 'symbol': 'BTC-USDT', 'timeframe': '15m'},
+    ]
+    candles = {
+        jh.key(exchange, 'BTC-USDT'): _candles('BTC-USDT', 0),
+        jh.key(exchange, 'ETH-USDT'): _candles('ETH-USDT', 5),
+    }
+
+    research.backtest(config_input, routes, data_routes, candles)
 
 
 def test_increasing_long_position_size_after_opening():

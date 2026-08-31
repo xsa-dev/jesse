@@ -215,6 +215,7 @@ def _execute_isolated_backtest(
     validate_routes(router)
     # initiate candle store
     store.candles.init_storage(5000)
+    store.candles.enforce_warmup = jesse_config['env']['data']['warmup_candles_num'] > 0
     # initialize exchanges state
     exchange_service.initialize_exchanges_state()
     # initialize orders state
@@ -231,6 +232,11 @@ def _execute_isolated_backtest(
 
     # if warmup_candles is passed, use it
     if warmup_candles:
+        # The latest instrument start is the first boundary shared by every stream.
+        initial_common_start = max(
+            int(candle_data['candles'][0, 0])
+            for candle_data in trading_candles_dict.values()
+        )
         for c in jesse_config['app']['considering_candles']:
             key = jh.key(c[0], c[1])
             # inject warm-up candles
@@ -238,7 +244,7 @@ def _execute_isolated_backtest(
                 warmup_candles_dict[key]['candles'],
                 c[0],
                 c[1],
-                available_at=int(trading_candles_dict[key]['candles'][0, 0]),
+                available_at=initial_common_start,
             )
 
     # run backtest simulation

@@ -498,15 +498,11 @@ def load_candles(start_date: int, finish_date: int) -> Tuple[dict, dict]:
 def _handle_warmup_candles(warmup_candles: dict, start_date: str) -> None:
     try:
         store.candles.uses_timestamp_buckets = _supports_observed_timestamp_replay_scope()
+        store.candles.enforce_warmup = True
         for c in config['app']['considering_candles']:
             exchange, symbol = c[0], c[1]
             candle_array = warmup_candles[jh.key(exchange, symbol)]['candles']
             candle_service.validate_observed_one_minute_candles(candle_array, exchange, symbol)
-            if _has_sparse_timestamps(candle_array) and not _supports_observed_timestamp_replay_scope():
-                raise exceptions.InvalidRoutes(
-                    'Sparse candle replay currently supports one instrument with trading and data routes. '
-                    'Multiple instruments require the M4C event merger.'
-                )
             candle_service.inject_warmup_candles_to_store(
                 candle_array,
                 exchange,
@@ -538,7 +534,7 @@ def simulator(*args, fast_mode: bool = False, **kwargs) -> dict:
     store.candles.uses_timestamp_buckets = uses_timestamp_replay
     if uses_timestamp_replay:
         # Timestamp events must have identical visibility and callback ordering in both modes.
-        return _step_simulator(*args, **kwargs)
+        return _timestamp_simulator(*args, fast_mode=fast_mode, **kwargs)
     if fast_mode:
         return _skip_simulator(*args, **kwargs)
 
@@ -546,37 +542,53 @@ def simulator(*args, fast_mode: bool = False, **kwargs) -> dict:
 
 
 def _uses_observed_timestamp_replay(candles: dict) -> bool:
-    """Select timestamp replay for one instrument and reject sparse multi-instrument runs."""
-    supported_scope = len(candles) == 1 and _supports_observed_timestamp_replay_scope()
-    if supported_scope:
-        return True
-
-    candle_arrays = [candle_data['candles'] for candle_data in candles.values()]
-    sparse = any(_has_sparse_timestamps(candle_array) for candle_array in candle_arrays)
-    timelines_match = all(
-        np.array_equal(candle_array[:, 0], candle_arrays[0][:, 0])
-        for candle_array in candle_arrays[1:]
-    )
-    if sparse or not timelines_match:
-        raise exceptions.InvalidRoutes(
-            'Sparse candle replay currently supports one instrument with trading and data routes. '
-            'Multiple instruments require the M4C event merger.'
-        )
-    return False
+    """Use one timestamp-driven engine for dense and sparse instrument streams."""
+    return bool(candles)
 
 
 def _supports_observed_timestamp_replay_scope() -> bool:
-    if len(config['app']['considering_candles']) != 1 or len(router.routes) != 1:
-        return False
-    exchange, symbol = config['app']['considering_candles'][0]
-    return all(
-        route.exchange == exchange and route.symbol == symbol
-        for route in router.routes + router.data_routes
+    return bool(config['app']['considering_candles'] and router.routes)
+
+
+def _timestamp_replay_common_start(candles: dict) -> int:
+    """Return one source timestamp after every route has its required warmup."""
+    if not candles:
+        raise ValueError('At least one observed candle series is required.')
+    common_start = max(int(candle_data['candles'][0, 0]) for candle_data in candles.values())
+    required_warmup = (
+        jh.get_config('env.data.warmup_candles_num', 0)
+        if store.candles.enforce_warmup
+        else 0
     )
+    for route in router.routes + router.data_routes:
+        completed_count = len(store.candles.get_storage(
+            route.exchange,
+            route.symbol,
+            route.timeframe,
+        ))
+        deficit = required_warmup - completed_count
+        if deficit <= 0:
+            continue
+        key = jh.key(route.exchange, route.symbol)
+        candle_array = candles[key]['candles']
+        timeframe_ms = TIMEFRAME_TO_ONE_MINUTES[route.timeframe] * 60_000
+        bucket_starts = np.unique(
+            (candle_array[:, 0].astype(np.int64) // timeframe_ms) * timeframe_ms
+        )
+        if len(bucket_starts) <= deficit:
+            raise exceptions.CandlesNotFound(
+                f'{route.symbol} on {route.exchange} does not contain {required_warmup} completed '
+                f'{route.timeframe} warmup candles followed by at least one trading candle.'
+            )
+        common_start = max(common_start, int(bucket_starts[deficit - 1]) + timeframe_ms)
 
-
-def _has_sparse_timestamps(candles: np.ndarray) -> bool:
-    return len(candles) < 2 or bool((np.diff(candles[:, 0]) != 60_000).any())
+    for candle_data in candles.values():
+        if not (candle_data['candles'][:, 0] >= common_start).any():
+            raise exceptions.CandlesNotFound(
+                f"No trading candle remains for {candle_data['symbol']} on {candle_data['exchange']} "
+                f'after the common warmup boundary {jh.timestamp_to_time(common_start)}.'
+            )
+    return common_start
 
 
 def _timestamp_bucket_generation_schedule(
@@ -600,6 +612,300 @@ def _timestamp_bucket_generation_schedule(
                     (timeframe, int(start))
                 )
     return schedule
+
+
+def _build_timestamp_replay_plan(
+        candles: dict,
+        generating_timeframes: list[tuple[str, int]],
+) -> tuple[int, list[dict]]:
+    """Merge unequal source streams and aggregate releases into ordered availability events."""
+    common_start = _timestamp_replay_common_start(candles)
+    events: dict[int, dict] = {}
+    for key in sorted(candles):
+        candle_array = candles[key]['candles']
+        timestamps = candle_array[:, 0].astype(np.int64)
+        first_trading_index = int(np.searchsorted(timestamps, common_start, side='left'))
+        for index in range(first_trading_index, len(candle_array)):
+            event_time = int(timestamps[index]) + 60_000
+            event = events.setdefault(event_time, {
+                'time': event_time,
+                'sources': [],
+                'aggregates': [],
+            })
+            event['sources'].append((key, index))
+
+        schedule = _timestamp_bucket_generation_schedule(candle_array, generating_timeframes)
+        for release_index, updates in schedule.items():
+            if release_index < first_trading_index:
+                continue
+            event_time = int(timestamps[release_index]) + 60_000
+            event = events.setdefault(event_time, {
+                'time': event_time,
+                'sources': [],
+                'aggregates': [],
+            })
+            event['aggregates'].extend(
+                (key, timeframe, start)
+                for timeframe, start in updates
+            )
+
+    ordered_events = [events[event_time] for event_time in sorted(events)]
+    for event in ordered_events:
+        event['sources'].sort()
+        event['aggregates'].sort()
+    return common_start, ordered_events
+
+
+def _prepare_timestamp_replay_warmup(candles: dict, common_start: int) -> None:
+    """Move pre-common source rows into warmup and enforce one shared safe start."""
+    for key in sorted(candles):
+        candle_data = candles[key]
+        exchange, symbol = candle_data['exchange'], candle_data['symbol']
+        candle_array = candle_data['candles']
+        pre_start = candle_array[candle_array[:, 0] < common_start]
+        if len(pre_start):
+            candle_service.batch_add_candle(
+                pre_start,
+                exchange,
+                symbol,
+                timeframes.MINUTE_1,
+                with_generation=False,
+            )
+
+        visible_source = candle_service.get_candles(exchange, symbol, timeframes.MINUTE_1)
+        if len(visible_source) == 0:
+            continue
+        for timeframe in config['app']['considering_timeframes']:
+            if timeframe == timeframes.MINUTE_1:
+                continue
+            generated = candle_service.generate_completed_candles_from_observed_minutes(
+                timeframe,
+                visible_source,
+                common_start,
+            )
+            candle_service.batch_add_candle(
+                generated,
+                exchange,
+                symbol,
+                timeframe,
+                with_generation=False,
+            )
+
+    required_warmup = (
+        jh.get_config('env.data.warmup_candles_num', 0)
+        if store.candles.enforce_warmup
+        else 0
+    )
+    if required_warmup <= 0:
+        return
+    for route in router.routes + router.data_routes:
+        completed_count = len(store.candles.get_storage(
+            route.exchange,
+            route.symbol,
+            route.timeframe,
+        ))
+        if completed_count < required_warmup:
+            raise exceptions.CandlesNotFound(
+                f'Only {completed_count} of {required_warmup} required completed {route.timeframe} '
+                f'warmup candles are available for {route.symbol} on {route.exchange} before '
+                f'{jh.timestamp_to_time(common_start)}.'
+            )
+
+
+def _apply_timestamp_replay_event(
+        event: dict,
+        candles: dict,
+        candles_pipelines: Dict[str, BaseCandlesPipeline | None],
+        process_orders: bool,
+) -> tuple[set[tuple[str, str, str]], set[tuple[str, str]]]:
+    """Atomically expose one union event and return its exact updates and real source pairs."""
+    # Historical trade timestamps are floats because candle arrays are float64;
+    # retain that public result shape while event-plan keys stay exact integers.
+    store.app.time = float(event['time'])
+    source_updates = []
+    for key, index in event['sources']:
+        candle_data = candles[key]
+        candle_array = candle_data['candles']
+        candles_pipeline = candles_pipelines[key]
+        if candles_pipeline is None:
+            source_candle = candle_array[index]
+        else:
+            source_candle = candles_pipeline.get_candles(
+                candle_array[index:index + candles_pipeline._batch_size],
+                index,
+                -1,
+            )
+            candle_array[index] = source_candle
+        exchange, symbol = candle_data['exchange'], candle_data['symbol']
+        source_storage = store.candles.get_storage(exchange, symbol, timeframes.MINUTE_1)
+        previous_close = source_storage[-1][2] if len(source_storage) else None
+        source_updates.append((key, exchange, symbol, source_candle, previous_close))
+
+    updated_routes: set[tuple[str, str, str]] = set()
+    source_pairs: set[tuple[str, str]] = set()
+    for _, exchange, symbol, source_candle, previous_close in source_updates:
+        candle_service.add_candle(
+            source_candle,
+            exchange,
+            symbol,
+            timeframes.MINUTE_1,
+            with_execution=False,
+            with_generation=False,
+        )
+        updated_routes.add((exchange, symbol, timeframes.MINUTE_1))
+        source_pairs.add((exchange, symbol))
+
+    aggregates_by_key: dict[str, list[tuple[str, int]]] = {}
+    for key, timeframe, start in event['aggregates']:
+        aggregates_by_key.setdefault(key, []).append((timeframe, start))
+
+    # Every source row is visible before price effects begin. Within each
+    # instrument, preserve the dense simulator's price-before-aggregate order.
+    for key, exchange, symbol, source_candle, previous_close in source_updates:
+        if process_orders:
+            _simulate_price_change_effect(
+                source_candle,
+                exchange,
+                symbol,
+                previous_close=previous_close,
+            )
+
+        for timeframe, start in aggregates_by_key.pop(key, []):
+            timeframe_ms = TIMEFRAME_TO_ONE_MINUTES[timeframe] * 60_000
+            bucket_start = int(candles[key]['candles'][start, 0])
+            bucket_start -= bucket_start % timeframe_ms
+            visible_source = candle_service.get_candles(exchange, symbol, timeframes.MINUTE_1)
+            source_start = int(np.searchsorted(visible_source[:, 0], bucket_start, side='left'))
+            source_stop = int(np.searchsorted(
+                visible_source[:, 0],
+                bucket_start + timeframe_ms,
+                side='left',
+            ))
+            generated = candle_service.generate_candle_from_observed_minutes(
+                timeframe,
+                visible_source[source_start:source_stop],
+            )
+            candle_service.add_candle(
+                generated,
+                exchange,
+                symbol,
+                timeframe,
+                with_execution=False,
+                with_generation=False,
+            )
+            available_at = int(generated[0]) + timeframe_ms
+            if available_at == event['time']:
+                updated_routes.add((exchange, symbol, timeframe))
+
+    return updated_routes, source_pairs
+
+
+def _timestamp_simulator(
+        candles: dict,
+        run_silently: bool,
+        fast_mode: bool = False,
+        hyperparameters: dict = None,
+        generate_csv: bool = False,
+        generate_json: bool = False,
+        generate_equity_curve: bool = False,
+        benchmark: bool = False,
+        generate_hyperparameters: bool = False,
+        generate_logs: bool = False,
+        with_candles_pipeline: bool = True,
+        candles_pipeline_class = None,
+        candles_pipeline_kwargs: dict = None,
+) -> dict:
+    """Replay dense or sparse instruments through one union of availability timestamps."""
+    if generate_logs:
+        config['app']['debug_mode'] = True
+    begin_time_track = time.time()
+    generating_timeframes = [
+        (timeframe, TIMEFRAME_TO_ONE_MINUTES[timeframe])
+        for timeframe in config['app']['considering_timeframes']
+        if timeframe != timeframes.MINUTE_1
+    ]
+    common_start, events = _build_timestamp_replay_plan(candles, generating_timeframes)
+    candles_pipelines = _prepare_routes(
+        hyperparameters=hyperparameters,
+        with_candles_pipeline=with_candles_pipeline,
+        candles_pipeline_class=candles_pipeline_class,
+        candles_pipeline_kwargs=candles_pipeline_kwargs,
+    )
+    _prepare_timestamp_replay_warmup(candles, common_start)
+    store.app.starting_time = common_start
+    store.app.time = common_start
+
+    save_daily_portfolio_balance(is_initial=True)
+    # Preserve Jesse's historical first sample after the first 1,440 source
+    # minutes, then keep a fixed daily schedule across market closures.
+    next_balance_sample_time = common_start + 86_460_000
+    balance_sample_cadence = (
+        _calculate_minimum_candle_step() * 60_000
+        if fast_mode
+        else 60_000
+    )
+    progressbar = Progressbar(len(events), step=420)
+    last_update_time = None
+    routes_info = sorted(
+        router.routes,
+        key=lambda route: (route.exchange, route.symbol, route.timeframe, str(route.strategy_name)),
+    )
+
+    for event_index, event in enumerate(events):
+        updated_routes, source_pairs = _apply_timestamp_replay_event(
+            event,
+            candles,
+            candles_pipelines,
+            process_orders=True,
+        )
+        if not run_silently:
+            last_update_time = _update_progress_bar(
+                progressbar,
+                run_silently,
+                event_index,
+                candle_step=420,
+                last_update_time=last_update_time,
+            )
+
+        for route in routes_info:
+            if (route.exchange, route.symbol, route.timeframe) in updated_routes:
+                route.strategy._execute()
+        for exchange, symbol in sorted(source_pairs):
+            order_service.update_active_orders(exchange, symbol)
+        order_service.execute_simulated_market_orders()
+
+        # Fast requests historically sampled equity only at skip boundaries.
+        # Keep that result compatibility while candle replay itself stays event-driven.
+        is_balance_sample_event = (
+            (int(store.app.time) - common_start) % balance_sample_cadence == 0
+        )
+        if int(store.app.time) >= next_balance_sample_time and is_balance_sample_event:
+            save_daily_portfolio_balance()
+            while next_balance_sample_time <= int(store.app.time):
+                next_balance_sample_time += 86_400_000
+
+    _finish_progress_bar(progressbar, run_silently)
+    execution_duration = 0
+    if not run_silently:
+        execution_duration = round(time.time() - begin_time_track, 2)
+
+    for route in routes_info:
+        route.strategy._terminate()
+        order_service.execute_simulated_market_orders()
+    save_daily_portfolio_balance()
+    store.app.ending_time = store.app.time + 60_000
+
+    result = _generate_outputs(
+        candles,
+        generate_csv=generate_csv,
+        generate_json=generate_json,
+        generate_equity_curve=generate_equity_curve,
+        benchmark=benchmark,
+        generate_hyperparameters=generate_hyperparameters,
+        generate_logs=generate_logs,
+    )
+    result['execution_duration'] = execution_duration
+    return result
 
 
 def _step_simulator(

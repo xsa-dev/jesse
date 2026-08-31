@@ -224,20 +224,25 @@ def inject_warmup_candles_to_store(
         raise ValueError(f'Could not inject warmup candles because the passed candles are empty. Have you imported enough warmup candles for {exchange}/{symbol}?')
 
     from jesse.config import config
-    from jesse.store import store
-
-    # batch add 1m candles:
-    batch_add_candle(candles, exchange, symbol, '1m', with_generation=False)
 
     if available_at is None:
         available_at = int(candles[-1, 0]) + 60_000
+    observable_candles = candles[candles[:, 0] + 60_000 <= available_at]
+    if len(observable_candles) == 0:
+        raise ValueError(
+            f'Warmup candles for {exchange}/{symbol} do not close before the common trading start.'
+        )
+
+    # Warmup must never preload a source row whose closing boundary is in the
+    # trading period; doing so would expose its final OHLCV before simulation.
+    batch_add_candle(observable_candles, exchange, symbol, '1m', with_generation=False)
 
     for timeframe in config['app']['considering_timeframes']:
         if timeframe == '1m':
             continue
         generated_candles = generate_completed_candles_from_observed_minutes(
             timeframe,
-            candles,
+            observable_candles,
             available_at,
         )
         batch_add_candle(
@@ -807,16 +812,15 @@ def _get_timestamp_bucket_candles(exchange: str, symbol: str, timeframe: str) ->
     long_arr: DynamicNumpyArray = storage.get(f'{exchange}-{symbol}-{timeframe}')
     if long_arr is None:
         raise RouteNotFound(symbol, timeframe)
-    long_array, long_index = long_arr.snapshot()
 
     timeframe_ms = jh.timeframe_to_one_minutes(timeframe) * 60_000
     current_bucket_start = int(short_array[short_index, 0])
     current_bucket_start -= current_bucket_start % timeframe_ms
-    if long_index >= 0 and int(long_array[long_index, 0]) == current_bucket_start:
-        return long_array[:long_index + 1]
 
     visible_short = short_array[:short_index + 1]
     bucket_start_index = int(np.searchsorted(visible_short[:, 0], current_bucket_start, side='left'))
+    # A previous strategy read may have stored an earlier snapshot of this
+    # forming bucket; add_candle updates that row with every newly visible minute.
     forming_candle = generate_candle_from_observed_minutes(
         timeframe,
         visible_short[bucket_start_index:],

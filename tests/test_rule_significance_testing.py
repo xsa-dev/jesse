@@ -13,6 +13,7 @@ from jesse.research.rule_significance_testing.common import (
     _annualization_factor,
     _elapsed_annualization_factor,
 )
+from jesse.research.rule_significance_testing.simulator import run_signal_only_backtest
 from jesse.routes import router
 from jesse.store import store
 from jesse.strategies import Strategy
@@ -167,6 +168,51 @@ def _assert_research_runtime_is_clean() -> None:
     assert store.orders.storage == {}
     assert jh.is_backtesting() is False
     assert jh.is_optimizing() is False
+
+
+def test_signal_only_backtest_uses_sparse_clock_events_and_atomic_data_routes():
+    start = 1_704_067_200_000
+    exchange = 'Sparse Significance Exchange'
+    symbol = 'BTC-USDT'
+    candles_array = np.array([
+        [start + minute * 60_000, 10 + minute, 11 + minute, 12 + minute, 9 + minute, 1 + minute]
+        for minute in [0, 1, 12, 14]
+    ], dtype=np.float64)
+    config_input = {
+        'starting_balance': 10_000,
+        'fee': 0,
+        'type': 'futures',
+        'futures_leverage': 1,
+        'futures_leverage_mode': 'cross',
+        'exchange': exchange,
+        'warm_up_candles': 0,
+    }
+    routes = [{
+        'exchange': exchange,
+        'strategy': 'TestSparseTimestampRoutes',
+        'symbol': symbol,
+        'timeframe': '5m',
+    }]
+    data_routes = [{'exchange': exchange, 'symbol': symbol, 'timeframe': '15m'}]
+    candles = {
+        jh.key(exchange, symbol): {
+            'exchange': exchange,
+            'symbol': symbol,
+            'candles': candles_array,
+        },
+    }
+
+    timestamps, close_prices, signals = run_signal_only_backtest(
+        config_input,
+        routes,
+        data_routes,
+        candles,
+    )
+
+    np.testing.assert_array_equal(timestamps, np.array([start + 900_000], dtype=np.int64))
+    np.testing.assert_array_equal(close_prices, np.array([25], dtype=np.float64))
+    np.testing.assert_array_equal(signals, np.array([0], dtype=np.int8))
+    _assert_research_runtime_is_clean()
 
 
 def test_noise_signal_is_not_statistically_significant():
