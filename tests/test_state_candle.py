@@ -170,7 +170,8 @@ def test_warmup_injection_generates_exact_5m_15m_and_1h_candles():
 
     # Use exactly one aligned hour of steadily increasing OHLCV data so every
     # generated timeframe has complete buckets with easy-to-audit values.
-    start = 1_700_000_040_000
+    start = 1_700_000_000_000
+    start -= start % 3_600_000
     candles = np.array([
         [start + i * 60_000, i + 1, i + 2, i + 3, i, 1]
         for i in range(60)

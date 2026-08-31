@@ -237,7 +237,8 @@ def _execute_isolated_backtest(
             candle_service.inject_warmup_candles_to_store(
                 warmup_candles_dict[key]['candles'],
                 c[0],
-                c[1]
+                c[1],
+                available_at=int(trading_candles_dict[key]['candles'][0, 0]),
             )
 
     # run backtest simulation

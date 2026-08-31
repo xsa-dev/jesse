@@ -356,12 +356,12 @@ def test_dna_method_works_in_isolated_backtest():
 
 
 @pytest.mark.parametrize('fast_mode', [False, True], ids=['step', 'fast'])
-def test_backtest_rejects_missing_internal_one_minute_candles(fast_mode: bool):
+def test_backtest_replays_observed_internal_gaps(fast_mode: bool):
+    observed_times = []
+
     class TestStrategy(Strategy):
         def before(self):
-            # Reaching a lifecycle hook would mean validation happened too late,
-            # after the simulator had already started mutating shared state.
-            raise AssertionError('strategy must not execute with missing input candles')
+            observed_times.append(self.time)
 
         def should_long(self):
             return False
@@ -373,12 +373,10 @@ def test_backtest_rejects_missing_internal_one_minute_candles(fast_mode: bool):
             pass
 
     candles = candles_from_close_prices([101, 102, 103, 104, 105, 106, 107, 108, 109, 110])
-    # Keep the first intervals valid and remove an internal row to prove that
-    # validation covers the complete source timeline rather than one boundary.
+    # Remove an internal row to prove research uses provider-observed events
+    # without manufacturing a callback for the absent minute.
     candles = np.delete(candles, 5, axis=0)
-    previous_timestamp = int(candles[4][0])
-    expected_timestamp = previous_timestamp + 60_000
-    actual_timestamp = int(candles[5][0])
+    expected_times = (candles[:, 0] + 60_000).tolist()
 
     exchange_name = 'Fake Exchange'
     symbol = 'FAKE-USDT'
@@ -404,15 +402,9 @@ def test_backtest_rejects_missing_internal_one_minute_candles(fast_mode: bool):
         },
     }
 
-    expected_message = (
-        f'Missing 1 one-minute candle for {symbol} on {exchange_name}. '
-        f'Expected timestamp {expected_timestamp} after {previous_timestamp}, '
-        f'but got {actual_timestamp}.'
-    )
-    with pytest.raises(ValueError) as exc_info:
-        research.backtest(config, routes, data_routes, candles, fast_mode=fast_mode)
+    research.backtest(config, routes, data_routes, candles, fast_mode=fast_mode)
 
-    assert str(exc_info.value) == expected_message
+    assert observed_times == expected_times
 
 
 def test_passed_candles_are_not_affected_by_running_isolated_backtests():

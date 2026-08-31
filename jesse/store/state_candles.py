@@ -12,6 +12,9 @@ class CandlesState:
         self.storage = {}
         self.are_all_initiated = False
         self.initiated_pairs = {}
+        # Sparse single-instrument replay derives forming candles from clock
+        # buckets; live and pre-M4C multi-instrument paths retain row-count behavior.
+        self.uses_timestamp_buckets = False
 
     def mark_all_as_initiated(self) -> None:
         for k in self.initiated_pairs:

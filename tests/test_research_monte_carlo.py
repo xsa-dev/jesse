@@ -256,10 +256,10 @@ def test_trade_monte_carlo_cleans_up_after_original_backtest_failure() -> None:
 def test_candle_monte_carlo_cleans_up_after_original_backtest_failure() -> None:
     config_input, routes, candles = _monte_carlo_inputs()
     candle_key = next(iter(candles))
-    candles[candle_key]['candles'] = np.delete(candles[candle_key]['candles'], 100, axis=0)
+    candles[candle_key]['candles'][100, 0] = candles[candle_key]['candles'][99, 0]
     ray_was_initialized = ray.is_initialized()
 
-    with pytest.raises(ValueError, match='Missing 1 one-minute candle'):
+    with pytest.raises(ValueError, match='strictly increasing unique timestamps'):
         research.monte_carlo_candles(
             config_input,
             routes,

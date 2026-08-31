@@ -497,17 +497,24 @@ def load_candles(start_date: int, finish_date: int) -> Tuple[dict, dict]:
 
 def _handle_warmup_candles(warmup_candles: dict, start_date: str) -> None:
     try:
+        store.candles.uses_timestamp_buckets = _supports_observed_timestamp_replay_scope()
         for c in config['app']['considering_candles']:
             exchange, symbol = c[0], c[1]
             candle_array = warmup_candles[jh.key(exchange, symbol)]['candles']
             candle_service.validate_observed_one_minute_candles(candle_array, exchange, symbol)
             if _has_sparse_timestamps(candle_array) and not _supports_observed_timestamp_replay_scope():
                 raise exceptions.InvalidRoutes(
-                    'Sparse candle replay currently supports one trading route, one symbol, and the 1m timeframe.'
+                    'Sparse candle replay currently supports one instrument with trading and data routes. '
+                    'Multiple instruments require the M4C event merger.'
                 )
-            candle_service.inject_warmup_candles_to_store(candle_array, exchange, symbol)
+            candle_service.inject_warmup_candles_to_store(
+                candle_array,
+                exchange,
+                symbol,
+                available_at=jh.date_to_timestamp(start_date),
+            )
     except ValueError as e:
-        # This date is an import suggestion; sparse 1m warmup itself counts observed rows.
+        # This date is an import suggestion; sparse warmup counts completed observed buckets.
         warmup_num = jh.get_config('env.data.warmup_candles_num', 210)
         max_timeframe = jh.max_timeframe(config['app']['considering_timeframes'])
         warmup_minutes = TIMEFRAME_TO_ONE_MINUTES[max_timeframe] * warmup_num
@@ -527,8 +534,10 @@ def _handle_warmup_candles(warmup_candles: dict, start_date: str) -> None:
 
 def simulator(*args, fast_mode: bool = False, **kwargs) -> dict:
     candles = args[0] if args else kwargs['candles']
-    if _uses_observed_timestamp_replay(candles):
-        # A 1m event has no useful fast-mode batch; both modes consume the same observed timestamps.
+    uses_timestamp_replay = _uses_observed_timestamp_replay(candles)
+    store.candles.uses_timestamp_buckets = uses_timestamp_replay
+    if uses_timestamp_replay:
+        # Timestamp events must have identical visibility and callback ordering in both modes.
         return _step_simulator(*args, **kwargs)
     if fast_mode:
         return _skip_simulator(*args, **kwargs)
@@ -537,7 +546,7 @@ def simulator(*args, fast_mode: bool = False, **kwargs) -> dict:
 
 
 def _uses_observed_timestamp_replay(candles: dict) -> bool:
-    """Select or constrain the first sparse-safe replay scope without changing legacy dense routes."""
+    """Select timestamp replay for one instrument and reject sparse multi-instrument runs."""
     supported_scope = len(candles) == 1 and _supports_observed_timestamp_replay_scope()
     if supported_scope:
         return True
@@ -550,22 +559,47 @@ def _uses_observed_timestamp_replay(candles: dict) -> bool:
     )
     if sparse or not timelines_match:
         raise exceptions.InvalidRoutes(
-            'Sparse candle replay currently supports one trading route, one symbol, and the 1m timeframe.'
+            'Sparse candle replay currently supports one instrument with trading and data routes. '
+            'Multiple instruments require the M4C event merger.'
         )
     return False
 
 
 def _supports_observed_timestamp_replay_scope() -> bool:
-    return (
-        len(config['app']['considering_candles']) == 1
-        and len(router.routes) == 1
-        and not router.data_routes
-        and router.routes[0].timeframe == timeframes.MINUTE_1
+    if len(config['app']['considering_candles']) != 1 or len(router.routes) != 1:
+        return False
+    exchange, symbol = config['app']['considering_candles'][0]
+    return all(
+        route.exchange == exchange and route.symbol == symbol
+        for route in router.routes + router.data_routes
     )
 
 
 def _has_sparse_timestamps(candles: np.ndarray) -> bool:
     return len(candles) < 2 or bool((np.diff(candles[:, 0]) != 60_000).any())
+
+
+def _timestamp_bucket_generation_schedule(
+        candles: np.ndarray,
+        generating_timeframes: list[tuple[str, int]],
+) -> dict[int, list[tuple[str, int]]]:
+    """Map each completed nonempty clock bucket to its first observed availability event."""
+    schedule: dict[int, list[tuple[str, int]]] = {}
+    event_times = candles[:, 0].astype(np.int64) + 60_000
+    timestamps = candles[:, 0].astype(np.int64)
+    for timeframe, timeframe_minutes in generating_timeframes:
+        timeframe_ms = timeframe_minutes * 60_000
+        bucket_starts = (timestamps // timeframe_ms) * timeframe_ms
+        boundaries = np.flatnonzero(np.diff(bucket_starts)) + 1
+        starts = np.concatenate(([0], boundaries))
+        for start in starts:
+            bucket_end = int(bucket_starts[start]) + timeframe_ms
+            release_index = int(np.searchsorted(event_times, bucket_end, side='left'))
+            if release_index < len(candles):
+                schedule.setdefault(release_index, []).append(
+                    (timeframe, int(start))
+                )
+    return schedule
 
 
 def _step_simulator(
@@ -620,6 +654,11 @@ def _step_simulator(
         for timeframe in config['app']['considering_timeframes']
         if timeframe != timeframes.MINUTE_1
     ]
+    timestamp_generation_schedule = (
+        _timestamp_bucket_generation_schedule(first_candles_set, generating_timeframes)
+        if store.candles.uses_timestamp_buckets
+        else {}
+    )
     routes_info = [
         (r, TIMEFRAME_TO_ONE_MINUTES[r.timeframe], r.strategy, r.exchange, r.symbol)
         for r in router.routes
@@ -672,6 +711,8 @@ def _step_simulator(
         store_app.time = first_candles_set[i, 0] + 60_000
         i_next = i + 1
 
+        updated_timeframes = {timeframes.MINUTE_1}
+
         # add candles
         for candles_arr, candles_pipeline, exchange, symbol, arr_1m in candles_info:
             if arr_1m is not None:
@@ -706,9 +747,39 @@ def _step_simulator(
                 previous_close=previous_close,
             )
 
-            # generate and add candles for bigger timeframes
-            for timeframe, count in generating_timeframes:
-                if i_next % count == 0:
+            # Timestamp replay publishes every completed clock bucket at the
+            # first real source-candle event on or after that bucket's boundary.
+            if store.candles.uses_timestamp_buckets:
+                for timeframe, start in timestamp_generation_schedule.get(i, []):
+                    timeframe_ms = TIMEFRAME_TO_ONE_MINUTES[timeframe] * 60_000
+                    bucket_start = int(candles_arr[start, 0])
+                    bucket_start -= bucket_start % timeframe_ms
+                    visible_source = candle_service.get_candles(exchange, symbol, timeframes.MINUTE_1)
+                    source_start = int(np.searchsorted(visible_source[:, 0], bucket_start, side='left'))
+                    source_stop = int(np.searchsorted(
+                        visible_source[:, 0], bucket_start + timeframe_ms, side='left'
+                    ))
+                    generated_candle = candle_service.generate_candle_from_observed_minutes(
+                        timeframe,
+                        visible_source[source_start:source_stop],
+                    )
+                    add_candle(
+                        generated_candle,
+                        exchange,
+                        symbol,
+                        timeframe,
+                        with_execution=False,
+                        with_generation=False,
+                    )
+                    # A bucket crossed during a closure becomes visible when the
+                    # market resumes, but it cannot create a delayed strategy
+                    # callback pretending that its absent boundary had traded.
+                    if int(generated_candle[0]) + timeframe_ms == int(store_app.time):
+                        updated_timeframes.add(timeframe)
+            else:
+                for timeframe, count in generating_timeframes:
+                    if i_next % count != 0:
+                        continue
                     generated_candle = generate_candle_from_one_minutes(
                         timeframe,
                         candles_arr[(i_next - count):i_next]
@@ -731,8 +802,11 @@ def _step_simulator(
 
         # now that all new generated candles are ready, execute
         for r, count, strategy, exchange, symbol in routes_info:
+            if store.candles.uses_timestamp_buckets:
+                if r.timeframe in updated_timeframes:
+                    strategy._execute()
             # 1m timeframe
-            if count == 1:
+            elif count == 1:
                 strategy._execute()
             elif i_next % count == 0:
                 # print candle

@@ -110,10 +110,44 @@ def test_forming_candles():
 
     backtest_mode.run('000', False, {}, exchanges.SANDBOX, routes, data_routes, '2019-04-01', '2019-04-02', candles)
 
-    # use math.ceil because it must include forming candle too
-    assert len(candle_service.get_candles(exchanges.SANDBOX, 'BTC-USDT', timeframes.MINUTE_5)) == math.ceil(1382 / 5)
-    assert len(candle_service.get_candles(exchanges.SANDBOX, 'BTC-USDT', timeframes.MINUTE_15)) == math.ceil(
-        1382 / 15)
+    # Every nonempty clock bucket is represented, including the final forming bucket.
+    timestamps = test_candles_0[:, 0].astype(np.int64)
+    assert len(candle_service.get_candles(exchanges.SANDBOX, 'BTC-USDT', timeframes.MINUTE_5)) == len(
+        np.unique(timestamps // 300_000)
+    )
+    assert len(candle_service.get_candles(exchanges.SANDBOX, 'BTC-USDT', timeframes.MINUTE_15)) == len(
+        np.unique(timestamps // 900_000)
+    )
+
+
+@pytest.mark.parametrize('fast_mode', [False, True], ids=['step', 'fast'])
+def test_sparse_timestamp_routes_are_clock_aligned_and_atomic(fast_mode: bool):
+    set_up()
+    start = 1_704_067_200_000
+    # Minutes 02 through 11 are absent, leaving the entire 00:05 bucket empty.
+    observed_minutes = [0, 1, 12, 14]
+    candles_array = np.array([
+        [start + minute * 60_000, 10 + minute, 11 + minute, 12 + minute, 9 + minute, 1 + minute]
+        for minute in observed_minutes
+    ], dtype=np.float64)
+    candles = {
+        jh.key(exchanges.SANDBOX, 'BTC-USDT'): {
+            'exchange': exchanges.SANDBOX,
+            'symbol': 'BTC-USDT',
+            'candles': candles_array,
+        }
+    }
+    routes = [
+        {'symbol': 'BTC-USDT', 'timeframe': '5m', 'strategy': 'TestSparseTimestampRoutes'},
+    ]
+    data_routes = [
+        {'symbol': 'BTC-USDT', 'timeframe': '15m'},
+    ]
+
+    backtest_mode.run(
+        '000', False, {}, exchanges.SANDBOX, routes, data_routes,
+        '2019-04-01', '2019-04-02', candles, fast_mode=fast_mode,
+    )
 
 
 def test_increasing_long_position_size_after_opening():

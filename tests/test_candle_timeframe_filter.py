@@ -91,6 +91,45 @@ def test_higher_timeframe_candles_are_excluded(sqlite_candles):
     assert len(candles) == MINUTES
 
 
+def test_sparse_warmup_loads_completed_clock_buckets(sqlite_candles):
+    trading_start = START + 20 * 60_000
+    observed_minutes = [0, 7, 10, 14, 17]
+    _store([
+        _candle_row(START + minute * 60_000, '1m')
+        for minute in observed_minutes
+    ])
+
+    candles = candle_service._get_observed_warmup_candles_from_db(
+        EXCHANGE,
+        SYMBOL,
+        trading_start,
+        candle_count=2,
+        timeframe='5m',
+    )
+
+    assert candles[:, 0].tolist() == [
+        START + 10 * 60_000,
+        START + 14 * 60_000,
+        START + 17 * 60_000,
+    ]
+
+
+def test_sparse_warmup_reports_missing_completed_buckets(sqlite_candles):
+    _store([_candle_row(START, '1m')])
+
+    with pytest.raises(
+        candle_service.CandleNotFoundInDatabase,
+        match='Only 1 of 2 required completed 5m warmup candles',
+    ):
+        candle_service._get_observed_warmup_candles_from_db(
+            EXCHANGE,
+            SYMBOL,
+            START + 10 * 60_000,
+            candle_count=2,
+            timeframe='5m',
+        )
+
+
 def test_python_or_would_drop_the_is_null_branch():
     """Pins down *why* the condition must use `|` rather than `or`."""
     correct = (Candle.timeframe == '1m') | (Candle.timeframe.is_null())
