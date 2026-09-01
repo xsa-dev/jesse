@@ -1,7 +1,9 @@
 from jesse.models.Candle import Candle
 import jesse.helpers as jh
 from collections.abc import Sequence
+from collections.abc import Iterator
 from typing import List, TYPE_CHECKING
+from uuid import uuid4
 import numpy as np
 import arrow
 import peewee
@@ -12,6 +14,8 @@ if TYPE_CHECKING:
 
 # Nine values are bound per row; 5,000 remains below PostgreSQL's 65,535 bind-parameter limit.
 OBSERVED_CANDLE_INSERT_BATCH_SIZE = 5_000
+# Server-side cursor batches keep large CSV exports bounded without holding every row in Python.
+CANDLE_EXPORT_BATCH_SIZE = 5_000
 
 
 def delete_candles_from_db(exchange: str, symbol: str) -> None:
@@ -73,6 +77,58 @@ def get_existing_candles() -> List[dict]:
             })
 
     return results
+
+
+def get_stored_symbols(exchange: str) -> list[str]:
+    """Return the sorted symbols currently persisted for one historical source."""
+    return [
+        symbol
+        for (symbol,) in (
+            Candle.select(Candle.symbol)
+            .where(Candle.exchange == exchange)
+            .distinct()
+            .order_by(Candle.symbol.asc())
+            .tuples()
+        )
+    ]
+
+
+def stream_one_minute_candles(
+    exchange: str,
+    symbol: str,
+) -> Iterator[list[tuple[int, float, float, float, float, float]]]:
+    """Yield an ordered canonical candle series through a PostgreSQL server-side cursor."""
+    timeframe_condition = (Candle.timeframe == '1m') | Candle.timeframe.is_null()
+    query = (
+        Candle.select(
+            Candle.timestamp,
+            Candle.open,
+            Candle.close,
+            Candle.high,
+            Candle.low,
+            Candle.volume,
+        )
+        .where(
+            Candle.exchange == exchange,
+            Candle.symbol == symbol,
+            timeframe_condition,
+        )
+        .order_by(Candle.timestamp.asc())
+    )
+    sql, params = query.sql()
+    db = Candle._meta.database
+    opened_here = db.is_closed()
+    db.connect(reuse_if_open=True)
+    try:
+        # Named cursors fetch incrementally and require a transaction for their full lifetime.
+        with db.atomic(), db.connection().cursor(name=f'candle_export_{uuid4().hex}') as cursor:
+            cursor.itersize = CANDLE_EXPORT_BATCH_SIZE
+            cursor.execute(sql, params)
+            while rows := cursor.fetchmany(CANDLE_EXPORT_BATCH_SIZE):
+                yield rows
+    finally:
+        if opened_here and not db.is_closed():
+            db.close()
 
 
 def fetch_candles_from_db(exchange: str, symbol: str, timeframe: str, start_date: int, finish_date: int) -> tuple:

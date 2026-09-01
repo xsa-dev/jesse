@@ -65,6 +65,7 @@ class order_types:
 @dataclass
 class exchanges:
     SANDBOX = 'Sandbox'
+    CUSTOM_DATA = 'Custom Data'
     MASSIVE_STOCKS = 'Massive Stocks'
     MASSIVE_CURRENCIES = 'Massive Currencies'
     MASSIVE_INDICES = 'Massive Indices'

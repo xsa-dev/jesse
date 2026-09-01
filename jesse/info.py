@@ -528,6 +528,24 @@ exchange_info = {
         },
         "required_live_plan": "free",
     },
+    exchanges_enums.CUSTOM_DATA: {
+        "name": exchanges_enums.CUSTOM_DATA,
+        "url": "https://docs.jesse.trade",
+        "fee": 0.0004,
+        "type": "futures",
+        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_timeframes": [timeframes.MINUTE_1],
+        "modes": {
+            "backtesting": True,
+            "live_trading": False,
+        },
+        "required_live_plan": "free",
+        # Files can represent any market; Binance-style perpetual execution defaults remain editable.
+        "asset_class": "equity",
+        "instrument_type": "perpetual",
+        "simulation_model": "perpetual_futures",
+        "annualization": 252,
+    },
     exchanges_enums.MASSIVE_STOCKS: {
         "name": exchanges_enums.MASSIVE_STOCKS,
         "url": "https://massive.com",

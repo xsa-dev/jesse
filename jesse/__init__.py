@@ -56,7 +56,7 @@ from jesse.controllers.monte_carlo_controller import router as monte_carlo_route
 from jesse.controllers.exchange_controller import router as exchange_router
 from jesse.controllers.backtest_controller import router as backtest_router
 from jesse.controllers.significance_test_controller import router as significance_test_router
-from jesse.controllers.candles_controller import router as candles_router
+from jesse.controllers.candles_controller import export_router as candles_export_router, router as candles_router
 from jesse.controllers.strategy_controller import router as strategy_router
 from jesse.controllers.auth_controller import router as auth_router
 from jesse.controllers.config_controller import router as config_router
@@ -81,6 +81,7 @@ fastapi_app.include_router(exchange_router)
 fastapi_app.include_router(backtest_router)
 fastapi_app.include_router(significance_test_router)
 fastapi_app.include_router(candles_router)
+fastapi_app.include_router(candles_export_router)
 fastapi_app.include_router(strategy_router)
 fastapi_app.include_router(auth_router)
 fastapi_app.include_router(config_router)

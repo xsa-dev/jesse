@@ -533,8 +533,9 @@ def simulator(*args, fast_mode: bool = False, **kwargs) -> dict:
     uses_timestamp_replay = _uses_observed_timestamp_replay(candles)
     store.candles.uses_timestamp_buckets = uses_timestamp_replay
     if uses_timestamp_replay:
-        # Timestamp events must have identical visibility and callback ordering in both modes.
-        return _timestamp_simulator(*args, fast_mode=fast_mode, **kwargs)
+        if fast_mode:
+            return _skip_simulator(*args, **kwargs)
+        return _timestamp_simulator(*args, fast_mode=False, **kwargs)
     if fast_mode:
         return _skip_simulator(*args, **kwargs)
 
@@ -542,8 +543,22 @@ def simulator(*args, fast_mode: bool = False, **kwargs) -> dict:
 
 
 def _uses_observed_timestamp_replay(candles: dict) -> bool:
-    """Use one timestamp-driven engine for dense and sparse instrument streams."""
-    return bool(candles)
+    """Use timestamp replay only when source rows cannot share the dense minute index.
+
+    The legacy simulators are substantially faster for contiguous, aligned crypto data and have
+    identical event boundaries in that case. Real gaps or unequal instrument timelines require the
+    timestamp engine so absent rows remain absent and same-time updates stay atomic.
+    """
+    reference_timestamps = None
+    for candle_data in candles.values():
+        timestamps = candle_data['candles'][:, 0]
+        if len(timestamps) > 1 and not (np.diff(timestamps) == 60_000).all():
+            return True
+        if reference_timestamps is None:
+            reference_timestamps = timestamps
+        elif not np.array_equal(timestamps, reference_timestamps):
+            return True
+    return False
 
 
 def _supports_observed_timestamp_replay_scope() -> bool:
@@ -800,6 +815,88 @@ def _apply_timestamp_replay_event(
     return updated_routes, source_pairs
 
 
+def _timestamp_event_updates_trading_route(
+        event: dict,
+        candles: dict,
+        trading_routes: set[tuple[str, str, str]],
+) -> bool:
+    """Return whether an event makes at least one strategy route executable."""
+    for key, _ in event['sources']:
+        candle_data = candles[key]
+        if (candle_data['exchange'], candle_data['symbol'], timeframes.MINUTE_1) in trading_routes:
+            return True
+    for key, timeframe, _ in event['aggregates']:
+        candle_data = candles[key]
+        if (candle_data['exchange'], candle_data['symbol'], timeframe) in trading_routes:
+            return True
+    return False
+
+
+def _apply_timestamp_replay_batch(
+        events: list[dict],
+        candles: dict,
+) -> tuple[set[tuple[str, str, str]], set[tuple[str, str]]]:
+    """Publish a side-effect-free span at once while preserving its final event boundary.
+
+    The caller permits this only without orders, open positions, or candle pipelines, so skipped
+    intermediate events cannot execute user code, transform prices, fill orders, or liquidate.
+    """
+    endpoint = events[-1]
+    source_indices: dict[str, list[int]] = {}
+    for event in events:
+        for key, index in event['sources']:
+            source_indices.setdefault(key, []).append(index)
+
+    for key, indices in source_indices.items():
+        candle_data = candles[key]
+        exchange, symbol = candle_data['exchange'], candle_data['symbol']
+        source_rows = candle_data['candles'][indices]
+        store.candles.get_storage(exchange, symbol, timeframes.MINUTE_1).append_multiple(source_rows)
+        position = store.positions.get_position(exchange, symbol)
+        if position is not None:
+            position.current_price = source_rows[-1, 2]
+
+    updated_routes: set[tuple[str, str, str]] = set()
+    source_pairs: set[tuple[str, str]] = set()
+    for key, _ in endpoint['sources']:
+        candle_data = candles[key]
+        exchange, symbol = candle_data['exchange'], candle_data['symbol']
+        updated_routes.add((exchange, symbol, timeframes.MINUTE_1))
+        source_pairs.add((exchange, symbol))
+
+    for event in events:
+        for key, timeframe, start in event['aggregates']:
+            candle_data = candles[key]
+            exchange, symbol = candle_data['exchange'], candle_data['symbol']
+            timeframe_ms = TIMEFRAME_TO_ONE_MINUTES[timeframe] * 60_000
+            bucket_start = int(candle_data['candles'][start, 0])
+            bucket_start -= bucket_start % timeframe_ms
+            visible_source = candle_service.get_candles(exchange, symbol, timeframes.MINUTE_1)
+            source_start = int(np.searchsorted(visible_source[:, 0], bucket_start, side='left'))
+            source_stop = int(np.searchsorted(
+                visible_source[:, 0],
+                bucket_start + timeframe_ms,
+                side='left',
+            ))
+            generated = candle_service.generate_candle_from_observed_minutes(
+                timeframe,
+                visible_source[source_start:source_stop],
+            )
+            candle_service.add_candle(
+                generated,
+                exchange,
+                symbol,
+                timeframe,
+                with_execution=False,
+                with_generation=False,
+            )
+            if event is endpoint and int(generated[0]) + timeframe_ms == endpoint['time']:
+                updated_routes.add((exchange, symbol, timeframe))
+
+    store.app.time = float(endpoint['time'])
+    return updated_routes, source_pairs
+
+
 def _timestamp_simulator(
         candles: dict,
         run_silently: bool,
@@ -850,19 +947,51 @@ def _timestamp_simulator(
         router.routes,
         key=lambda route: (route.exchange, route.symbol, route.timeframe, str(route.strategy_name)),
     )
+    trading_routes = {
+        (route.exchange, route.symbol, route.timeframe)
+        for route in routes_info
+    }
+    can_batch_source_rows = fast_mode and all(pipeline is None for pipeline in candles_pipelines.values())
 
-    for event_index, event in enumerate(events):
-        updated_routes, source_pairs = _apply_timestamp_replay_event(
-            event,
-            candles,
-            candles_pipelines,
-            process_orders=True,
-        )
+    event_index = 0
+    while event_index < len(events):
+        event = events[event_index]
+        batch_end = event_index
+        if (
+            can_batch_source_rows
+            and store.orders.count_all_active_orders() == 0
+            and store.positions.count_open_positions() == 0
+        ):
+            while batch_end < len(events) - 1:
+                if _timestamp_event_updates_trading_route(events[batch_end], candles, trading_routes):
+                    break
+                event_time = int(events[batch_end]['time'])
+                is_balance_sample_event = (
+                    event_time >= next_balance_sample_time
+                    and (event_time - common_start) % balance_sample_cadence == 0
+                )
+                if is_balance_sample_event:
+                    break
+                batch_end += 1
+
+        if batch_end > event_index:
+            updated_routes, source_pairs = _apply_timestamp_replay_batch(
+                events[event_index:batch_end + 1],
+                candles,
+            )
+            event = events[batch_end]
+        else:
+            updated_routes, source_pairs = _apply_timestamp_replay_event(
+                event,
+                candles,
+                candles_pipelines,
+                process_orders=True,
+            )
         if not run_silently:
             last_update_time = _update_progress_bar(
                 progressbar,
                 run_silently,
-                event_index,
+                batch_end,
                 candle_step=420,
                 last_update_time=last_update_time,
             )
@@ -875,7 +1004,7 @@ def _timestamp_simulator(
         order_service.execute_simulated_market_orders()
 
         # Fast requests historically sampled equity only at skip boundaries.
-        # Keep that result compatibility while candle replay itself stays event-driven.
+        # Keep that result compatibility while decisions retain exact timestamp boundaries.
         is_balance_sample_event = (
             (int(store.app.time) - common_start) % balance_sample_cadence == 0
         )
@@ -883,6 +1012,8 @@ def _timestamp_simulator(
             save_daily_portfolio_balance()
             while next_balance_sample_time <= int(store.app.time):
                 next_balance_sample_time += 86_400_000
+
+        event_index = batch_end + 1
 
     _finish_progress_bar(progressbar, run_silently)
     execution_duration = 0
@@ -1276,26 +1407,26 @@ def get_candles_from_pipeline(candles_pipeline: Optional[BaseCandlesPipeline], c
 def _update_progress_bar(
         progressbar: Progressbar, run_silently: bool, candle_index: int, candle_step: int, last_update_time: float
 ) -> float:
-    if not run_silently:
-        _raise_if_cancelled(jh.get_session_id())
+    if run_silently:
+        return last_update_time
 
-    throttle_interval = 0.5
-    current_time = time.time()
-    if not run_silently and candle_index % candle_step == 0:
+    if candle_index % candle_step == 0:
         progressbar.update()
 
-        if last_update_time is None or (current_time - last_update_time) >= throttle_interval:
-            sync_publish(
-                "progressbar",
-                {
-                    "current": progressbar.current,
-                    "estimated_remaining_seconds": progressbar.estimated_remaining_seconds,
-                },
-            )
-            # Update the last update time
-            last_update_time = current_time
+    current_time = time.time()
+    # Cancellation uses Redis, so cap both polling and progress publication at twice per second.
+    # This also works when sparse fast-mode batches jump over exact candle-index boundaries.
+    if last_update_time is None or (current_time - last_update_time) >= 0.5:
+        _raise_if_cancelled(jh.get_session_id())
+        sync_publish(
+            "progressbar",
+            {
+                "current": progressbar.current,
+                "estimated_remaining_seconds": progressbar.estimated_remaining_seconds,
+            },
+        )
+        last_update_time = current_time
 
-    # Return the last update time for future reference
     return last_update_time
 
 
@@ -1671,6 +1802,25 @@ def _skip_simulator(
         candles_pipeline_class = None,
         candles_pipeline_kwargs: dict = None,
 ) -> dict:
+    if _uses_observed_timestamp_replay(candles):
+        # The skip entry point shares the timestamp event core so sparse and
+        # unequal streams retain step mode's atomic visibility and order rules.
+        return _timestamp_simulator(
+            candles,
+            run_silently,
+            fast_mode=True,
+            hyperparameters=hyperparameters,
+            generate_csv=generate_csv,
+            generate_json=generate_json,
+            generate_equity_curve=generate_equity_curve,
+            benchmark=benchmark,
+            generate_hyperparameters=generate_hyperparameters,
+            generate_logs=generate_logs,
+            with_candles_pipeline=with_candles_pipeline,
+            candles_pipeline_class=candles_pipeline_class,
+            candles_pipeline_kwargs=candles_pipeline_kwargs,
+        )
+
     # In case generating logs is specifically demanded, the debug mode must be enabled.
     if generate_logs:
         config["app"]["debug_mode"] = True

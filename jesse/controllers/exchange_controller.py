@@ -18,6 +18,7 @@ from jesse.services.historical_data.errors import (
 from jesse.services.auth import require_auth
 from jesse.services.redis import sync_redis
 from jesse.services.web import ExchangeSupportedSymbolsRequestJson, StoreExchangeApiKeyRequestJson, DeleteExchangeApiKeyRequestJson
+from jesse.enums import exchanges
 
 
 router = APIRouter(prefix="/exchange", tags=["Exchange"], dependencies=[Depends(require_auth)])
@@ -80,6 +81,10 @@ def delete_exchange_api_keys_endpoint(json_request: DeleteExchangeApiKeyRequestJ
 
 
 def get_exchange_supported_symbols(exchange: str) -> JSONResponse:
+    if exchange == exchanges.CUSTOM_DATA:
+        from jesse.repositories.candle_repository import get_stored_symbols
+        return JSONResponse({'data': get_stored_symbols(exchange)}, status_code=200)
+
     cache_key = f'historical-symbols:v{HISTORICAL_SYMBOL_CATALOG_CACHE_VERSION}:{exchange}'
     cached_result = sync_redis.get(cache_key)
     if cached_result is not None:
