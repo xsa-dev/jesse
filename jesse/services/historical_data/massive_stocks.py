@@ -2,7 +2,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from math import isfinite
 from threading import Lock
@@ -206,6 +206,7 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
         symbols = []
         seen_symbols = set()
         symbol_markets: dict[str, str] = {}
+        ambiguous_symbols = set()
         for market in self.markets:
             url = MASSIVE_TICKERS_URL
             params: dict[str, str | int] | None = {
@@ -225,9 +226,10 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
                 for symbol in _normalize_ticker_search(payload, self.markets, self._catalog_symbol):
                     previous_market = symbol_markets.get(symbol)
                     if previous_market is not None and previous_market != market:
-                        raise ProviderSchemaError(
-                            f'Massive Currencies exposes ambiguous Forex and Crypto symbol {symbol!r}'
-                        )
+                        # Jesse's BASE-QUOTE form cannot distinguish a fiat pair from a crypto token
+                        # with the same code, so omit only that collision instead of losing the catalog.
+                        ambiguous_symbols.add(symbol)
+                        continue
                     if symbol not in seen_symbols:
                         symbols.append(symbol)
                         seen_symbols.add(symbol)
@@ -241,7 +243,7 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
                 raise ProviderPaginationError('Massive ticker pagination exceeded the safety limit')
         if not symbols:
             raise ProviderSchemaError(f'Massive returned an empty active-{",".join(self.markets)} catalog')
-        return tuple(sorted(symbols))
+        return tuple(sorted(symbol for symbol in symbols if symbol not in ambiguous_symbols))
 
     def _request_json(
         self,
@@ -559,9 +561,10 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
         product_currencies = self._load_product_currencies(api_key)
         url = MASSIVE_FUTURES_CONTRACTS_URL
         params: dict[str, str | int] | None = {
+            # A point-in-time snapshot avoids receiving one duplicate per contract per reference date.
+            'date': datetime.now(timezone.utc).date().isoformat(),
+            'active': 'true',
             'type': 'single',
-            # Include contracts whose final trade date falls within the entry plan's two-year history.
-            'last_trade_date.gte': (datetime.now(timezone.utc) - timedelta(days=730)).date().isoformat(),
             'sort': 'ticker.asc',
             'limit': 1_000,
         }
@@ -589,8 +592,10 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
     def _load_product_currencies(self, api_key: str) -> dict[str, str]:
         url = MASSIVE_FUTURES_PRODUCTS_URL
         params: dict[str, str | int] | None = {
+            'date': datetime.now(timezone.utc).date().isoformat(),
             'type': 'single',
-            'sort': 'product_code.asc',
+            # The live API currently accepts name/date sorting even though its docs also list product_code.
+            'sort': 'name.asc',
             # The endpoint permits 50,000 products, normally making this a single request.
             'limit': MASSIVE_PAGE_LIMIT,
         }
@@ -626,7 +631,8 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
         contract_payload = self._request_json(
             MASSIVE_FUTURES_CONTRACTS_URL,
             api_key,
-            {'ticker': provider_symbol, 'type': 'single', 'limit': 2},
+            # Without an explicit sort, Massive returns one copy per historical reference date.
+            {'ticker': provider_symbol, 'type': 'single', 'sort': 'date.desc', 'limit': 1},
         )
         contracts = [
             result
@@ -906,7 +912,8 @@ def _normalize_futures_contracts(
                 f'Massive Futures contract {ticker!r} references unknown product {product_code!r}'
             )
         if '-' in ticker:
-            raise ProviderSchemaError('Massive Futures contract tickers cannot contain dashes')
+            # Massive occasionally labels calendar spreads as `single`; Jesse imports outright contracts only.
+            continue
         symbols.append(f'{ticker}-{currency}')
     return tuple(symbols)
 
