@@ -203,7 +203,7 @@ Data Import: Use MCP tools to import and manage historical candle data for backt
 
 Import Workflow (mandatory):
 1. Call `import_candles()` — it returns immediately with `{"status": "started", "import_id": "..."}`.
-2. **Immediately and automatically** begin checking `get_candle_import_status(import_id)` every few seconds — do NOT ask the user to check or wait. This is your responsibility.
+2. **Immediately and automatically** begin checking `get_candle_import_status(import_id)` every few seconds until it reports `finished`, `failed`, or `cancelled` — do NOT ask the user to check or wait. This is your responsibility.
 3. Keep checking until `status` is `"finished"`.
 4. Only then report completion to the user.
 

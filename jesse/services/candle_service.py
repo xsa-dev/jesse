@@ -43,6 +43,43 @@ def generate_candle_from_one_minutes(
     ])
 
 
+def generate_candle_from_observed_minutes(timeframe: str, candles: np.ndarray) -> np.ndarray:
+    """Aggregate observed 1m rows that belong to one clock-aligned timeframe bucket."""
+    if len(candles) == 0:
+        raise ValueError('No candles were passed')
+
+    timeframe_ms = jh.timeframe_to_one_minutes(timeframe) * 60_000
+    bucket_start = int(candles[0, 0]) - (int(candles[0, 0]) % timeframe_ms)
+    if ((candles[:, 0].astype(np.int64) // timeframe_ms) * timeframe_ms != bucket_start).any():
+        raise ValueError(f'Observed candles span more than one "{timeframe}" clock bucket.')
+
+    generated = generate_candle_from_one_minutes(timeframe, candles, accept_forming_candles=True)
+    generated[0] = bucket_start
+    return generated
+
+
+def generate_completed_candles_from_observed_minutes(
+        timeframe: str,
+        candles: np.ndarray,
+        available_at: int,
+) -> np.ndarray:
+    """Aggregate nonempty clock buckets whose closing boundary is observable by ``available_at``."""
+    if len(candles) == 0:
+        return np.zeros((0, 6))
+
+    timeframe_ms = jh.timeframe_to_one_minutes(timeframe) * 60_000
+    bucket_starts = (candles[:, 0].astype(np.int64) // timeframe_ms) * timeframe_ms
+    boundaries = np.flatnonzero(np.diff(bucket_starts)) + 1
+    starts = np.concatenate(([0], boundaries))
+    stops = np.concatenate((boundaries, [len(candles)]))
+    generated = [
+        generate_candle_from_observed_minutes(timeframe, candles[start:stop])
+        for start, stop in zip(starts, stops)
+        if bucket_starts[start] + timeframe_ms <= available_at
+    ]
+    return np.array(generated) if generated else np.zeros((0, 6))
+
+
 def candle_dict_to_np_array(candle: dict) -> np.ndarray:
     return np.array([
         candle['timestamp'],
@@ -177,40 +214,44 @@ def split_candle(candle: np.ndarray, price: float) -> tuple:
         ])
 
 
-def inject_warmup_candles_to_store(candles: np.ndarray, exchange: str, symbol: str) -> None:
+def inject_warmup_candles_to_store(
+        candles: np.ndarray,
+        exchange: str,
+        symbol: str,
+        available_at: int | None = None,
+) -> None:
     if candles is None or candles.size == 0:
         raise ValueError(f'Could not inject warmup candles because the passed candles are empty. Have you imported enough warmup candles for {exchange}/{symbol}?')
 
     from jesse.config import config
-    from jesse.store import store
 
-    # batch add 1m candles:
-    batch_add_candle(candles, exchange, symbol, '1m', with_generation=False)
+    if available_at is None:
+        available_at = int(candles[-1, 0]) + 60_000
+    observable_candles = candles[candles[:, 0] + 60_000 <= available_at]
+    if len(observable_candles) == 0:
+        raise ValueError(
+            f'Warmup candles for {exchange}/{symbol} do not close before the common trading start.'
+        )
 
-    # loop to generate, and add candles (without execution)
-    for i in range(len(candles)):
-        for timeframe in config['app']['considering_timeframes']:
-            # skip 1m. already added
-            if timeframe == '1m':
-                continue
+    # Warmup must never preload a source row whose closing boundary is in the
+    # trading period; doing so would expose its final OHLCV before simulation.
+    batch_add_candle(observable_candles, exchange, symbol, '1m', with_generation=False)
 
-            num = jh.timeframe_to_one_minutes(timeframe)
-
-            if (i + 1) % num == 0:
-                generated_candle = generate_candle_from_one_minutes(
-                    timeframe,
-                    candles[(i - (num - 1)):(i + 1)],
-                    True
-                )
-
-                add_candle(
-                    generated_candle,
-                    exchange,
-                    symbol,
-                    timeframe,
-                    with_execution=False,
-                    with_generation=False
-                )
+    for timeframe in config['app']['considering_timeframes']:
+        if timeframe == '1m':
+            continue
+        generated_candles = generate_completed_candles_from_observed_minutes(
+            timeframe,
+            observable_candles,
+            available_at,
+        )
+        batch_add_candle(
+            generated_candles,
+            exchange,
+            symbol,
+            timeframe,
+            with_generation=False,
+        )
 
 
 def get_candles_from_db(
@@ -234,11 +275,26 @@ def get_candles_from_db(
     # if warmup_candles is set, calculate the warmup start and finish timestamps
     if warmup_candles_num > 0:
         warmup_finish_timestamp = trading_start_date_timestamp
-        warmup_start_timestamp = warmup_finish_timestamp - (
-                warmup_candles_num * jh.timeframe_to_one_minutes(timeframe) * 60_000)
-        warmup_finish_timestamp -= 60_000
-        warmup_candles = _get_candles_from_db(exchange, symbol, warmup_start_timestamp, warmup_finish_timestamp,
-                                              caching=caching)
+        if timeframe == '1m' or is_for_jesse:
+            warmup_candles = _get_observed_warmup_candles_from_db(
+                exchange,
+                symbol,
+                warmup_finish_timestamp,
+                warmup_candles_num,
+                timeframe=timeframe,
+                caching=caching,
+            )
+        else:
+            warmup_start_timestamp = warmup_finish_timestamp - (
+                    warmup_candles_num * jh.timeframe_to_one_minutes(timeframe) * 60_000)
+            warmup_finish_timestamp -= 60_000
+            warmup_candles = _get_candles_from_db(
+                exchange,
+                symbol,
+                warmup_start_timestamp,
+                warmup_finish_timestamp,
+                caching=caching,
+            )
     else:
         warmup_candles = None
 
@@ -308,30 +364,6 @@ def _get_candles_from_db(
     # Convert to numpy array for easier timestamp extraction
     candles_array = np.array(candles_tuple)
     
-    # Verify the retrieved data covers the requested range
-    if len(candles_array) > 0:
-        earliest_available = candles_array[0][0]  # First timestamp
-        latest_available = candles_array[-1][0]   # Last timestamp
-        
-        # Check if earliest available timestamp is after the requested start date
-        if earliest_available > start_date_timestamp + 60_000:  # Allow 1 minute tolerance
-            raise CandleNotFoundInDatabase(
-                f"Missing candles for {symbol} on {exchange}. "
-                f"Requested data from {jh.timestamp_to_date(start_date_timestamp)}, "
-                f"but earliest available candle is from {jh.timestamp_to_date(earliest_available)}."
-            )
-            
-        # For finish date validation, we need to check if we have candles up to exactly one minute
-        # before the start of the requested finish date
-        # Check if the latest available candle timestamp is before the required last candle
-        if latest_available < finish_date_timestamp:
-            # Missing candles at the end of the requested range
-            raise CandleNotFoundInDatabase(
-                f"Missing recent candles for \"{symbol}\" on \"{exchange}\". "
-                f"Requested data until \"{jh.timestamp_to_time(finish_date_timestamp)[:19]}\", "
-                f"but latest available candle is up to \"{jh.timestamp_to_time(latest_available)[:19]}\"."
-            )
-
     if caching:
         # cache for 1 week it for near future calls
         cache.set_value(cache_key, candles_tuple, expire_seconds=60 * 60 * 24 * 7)
@@ -339,22 +371,106 @@ def _get_candles_from_db(
     return candles_array
 
 
-def _get_generated_candles(timeframe, trading_candles) -> np.ndarray:
-    # generate candles for the requested timeframe
-    generated_candles = []
-    for i in range(len(trading_candles)):
-        num = jh.timeframe_to_one_minutes(timeframe)
+def _get_observed_warmup_candles_from_db(
+        exchange: str,
+        symbol: str,
+        trading_start_timestamp: int,
+        candle_count: int,
+        timeframe: str = '1m',
+        caching: bool = False,
+) -> np.ndarray:
+    """Load source rows covering the requested number of completed observed clock buckets."""
+    from jesse.models.Candle import Candle
+    from jesse.services.cache import cache
 
-        if (i + 1) % num == 0:
-            generated_candles.append(
-                generate_candle_from_one_minutes(
-                    timeframe,
-                    trading_candles[(i - (num - 1)):(i + 1)],
-                    True
-                )
+    cache_key = (
+        f'observed-warmup-{trading_start_timestamp}-{candle_count}-{timeframe}-'
+        f'{jh.key(exchange, symbol)}'
+    )
+    if caching:
+        cached_value = cache.get_value(cache_key)
+        if cached_value:
+            return np.array(cached_value)
+
+    timeframe_minutes = jh.timeframe_to_one_minutes(timeframe)
+    timeframe_ms = timeframe_minutes * 60_000
+    required_bucket_starts: set[int] = set()
+    cursor = trading_start_timestamp
+    # Cap each requested bucket at one source-hour per page; the 1,000-row floor
+    # avoids tiny repeated queries when closed sessions separate sparse buckets.
+    page_size = max(candle_count * min(timeframe_minutes, 60), 1_000)
+    while len(required_bucket_starts) < candle_count:
+        timestamps = list(
+            Candle.select(Candle.timestamp)
+            .where(
+                Candle.exchange == exchange,
+                Candle.symbol == symbol,
+                (Candle.timeframe == '1m') | Candle.timeframe.is_null(),
+                Candle.timestamp < cursor,
             )
+            .order_by(Candle.timestamp.desc())
+            .limit(page_size)
+            .tuples()
+        )
+        if not timestamps:
+            break
+        for (timestamp,) in timestamps:
+            bucket_start = int(timestamp) - (int(timestamp) % timeframe_ms)
+            if bucket_start + timeframe_ms <= trading_start_timestamp:
+                required_bucket_starts.add(bucket_start)
+        cursor = int(timestamps[-1][0])
 
-    return np.array(generated_candles)
+    if len(required_bucket_starts) < candle_count:
+        raise CandleNotFoundInDatabase(
+            f'Only {len(required_bucket_starts)} of {candle_count} required completed {timeframe} '
+            f'warmup candles were found '
+            f'for {symbol} on {exchange} before {jh.timestamp_to_date(trading_start_timestamp)}.'
+        )
+
+    earliest_bucket_start = sorted(required_bucket_starts, reverse=True)[candle_count - 1]
+    candles_tuple = list(
+        Candle.select(
+            Candle.timestamp,
+            Candle.open,
+            Candle.close,
+            Candle.high,
+            Candle.low,
+            Candle.volume,
+        )
+        .where(
+            Candle.exchange == exchange,
+            Candle.symbol == symbol,
+            (Candle.timeframe == '1m') | Candle.timeframe.is_null(),
+            Candle.timestamp >= earliest_bucket_start,
+            Candle.timestamp < trading_start_timestamp,
+        )
+        .order_by(Candle.timestamp.asc())
+        .tuples()
+    )
+    if caching:
+        cache.set_value(cache_key, candles_tuple, expire_seconds=60 * 60 * 24 * 7)
+    return np.array(candles_tuple)
+
+
+def validate_observed_one_minute_candles(candles: np.ndarray, exchange: str, symbol: str) -> None:
+    """Validate observed 1m rows without requiring candles at absent timestamps or range edges."""
+    if not isinstance(candles, np.ndarray) or candles.ndim != 2 or candles.shape[1] != 6 or len(candles) == 0:
+        raise ValueError(f'Candles for {symbol} on {exchange} must be a nonempty six-column array.')
+    timestamps = candles[:, 0]
+    if not np.isfinite(timestamps).all() or (timestamps % 60_000 != 0).any():
+        raise ValueError(f'Candles for {symbol} on {exchange} must have minute-aligned timestamps.')
+    if len(timestamps) > 1 and (np.diff(timestamps) <= 0).any():
+        raise ValueError(f'Candles for {symbol} on {exchange} must have strictly increasing unique timestamps.')
+
+
+def _get_generated_candles(timeframe, trading_candles) -> np.ndarray:
+    if len(trading_candles) == 0:
+        return np.zeros((0, 6))
+    return generate_completed_candles_from_observed_minutes(
+        timeframe,
+        trading_candles,
+        int(trading_candles[-1, 0]) + 60_000,
+    )
 
 
 def generate_new_candles_loop() -> None:
@@ -644,6 +760,9 @@ def get_candles(exchange: str, symbol: str, timeframe: str) -> np.ndarray:
             return np.zeros((0, 6))
         return array[:index + 1]
 
+    if store.candles.uses_timestamp_buckets:
+        return _get_timestamp_bucket_candles(exchange, symbol, timeframe)
+
     # other timeframes
     required_1m_to_complete_count = jh.timeframe_to_one_minutes(timeframe)
     short_arr: DynamicNumpyArray = storage.get(f'{exchange}-{symbol}-1m')
@@ -680,6 +799,45 @@ def get_candles(exchange: str, symbol: str, timeframe: str) -> np.ndarray:
         return long_array[:long_count]
 
 
+def _get_timestamp_bucket_candles(exchange: str, symbol: str, timeframe: str) -> np.ndarray:
+    """Return completed candles plus the current observed-only forming clock bucket."""
+    storage = store.candles.storage
+    short_arr: DynamicNumpyArray = storage.get(f'{exchange}-{symbol}-1m')
+    if short_arr is None:
+        raise RouteNotFound(symbol, '1m')
+    short_array, short_index = short_arr.snapshot()
+    if short_index == -1:
+        return np.zeros((0, 6))
+
+    long_arr: DynamicNumpyArray = storage.get(f'{exchange}-{symbol}-{timeframe}')
+    if long_arr is None:
+        raise RouteNotFound(symbol, timeframe)
+
+    timeframe_ms = jh.timeframe_to_one_minutes(timeframe) * 60_000
+    current_bucket_start = int(short_array[short_index, 0])
+    current_bucket_start -= current_bucket_start % timeframe_ms
+
+    visible_short = short_array[:short_index + 1]
+    bucket_start_index = int(np.searchsorted(visible_short[:, 0], current_bucket_start, side='left'))
+    # A previous strategy read may have stored an earlier snapshot of this
+    # forming bucket; add_candle updates that row with every newly visible minute.
+    forming_candle = generate_candle_from_observed_minutes(
+        timeframe,
+        visible_short[bucket_start_index:],
+    )
+    add_candle(
+        forming_candle,
+        exchange,
+        symbol,
+        timeframe,
+        with_execution=False,
+        with_generation=False,
+        with_skip=False,
+    )
+    long_array, long_index = long_arr.snapshot()
+    return long_array[:long_index + 1]
+
+
 def get_current_candle(exchange: str, symbol: str, timeframe: str) -> np.ndarray:
     # no need to worry for forming candles when timeframe == 1m
     if timeframe == '1m':
@@ -688,6 +846,10 @@ def get_current_candle(exchange: str, symbol: str, timeframe: str) -> np.ndarray
             return np.zeros((0, 6))
         else:
             return arr[-1]
+
+    if store.candles.uses_timestamp_buckets:
+        candles = _get_timestamp_bucket_candles(exchange, symbol, timeframe)
+        return candles[-1] if len(candles) else np.zeros((0, 6))
 
     # other timeframes
     dif, long_key, short_key = store.candles.forming_estimation(exchange, symbol, timeframe)

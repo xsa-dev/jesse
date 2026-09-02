@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import arrow
 import pytest
@@ -108,10 +109,26 @@ def _configure_import(monkeypatch, state, driver, fixed_now):
 
     database_events = []
     monkeypatch.setattr(importer, 'Candle', _candle_model(state))
-    monkeypatch.setitem(importer.drivers, driver.name, lambda: driver)
+    monkeypatch.setattr(importer, 'historical_provider_names', [driver.name])
+    monkeypatch.setattr(
+        importer,
+        'build_historical_provider_registry',
+        lambda provider_ids: SimpleNamespace(get=lambda provider_id: driver),
+    )
+    monkeypatch.setattr(
+        importer.candle_repository,
+        'get_candle_timestamp_bounds',
+        lambda exchange, symbol, timeframe: state.get('bounds', (None, None)),
+    )
+    monkeypatch.setattr(
+        importer.candle_repository,
+        'store_observed_candles',
+        lambda exchange, symbol, timeframe, candles: state.setdefault('stored', []).extend(candles),
+    )
     monkeypatch.setattr(importer.arrow, 'utcnow', lambda: fixed_now)
     monkeypatch.setattr(importer.jh, 'now_to_timestamp', lambda: fixed_now.int_timestamp * 1000 - 1)
     monkeypatch.setattr(importer.time, 'sleep', lambda seconds: None)
+    monkeypatch.setattr(importer, 'sync_publish', lambda event, payload: None)
     monkeypatch.setattr(database, 'open_connection', lambda: database_events.append('open'))
     monkeypatch.setattr(database, 'close_connection', lambda: database_events.append('close'))
     return database_events
@@ -122,16 +139,10 @@ def test_import_paginates_with_exact_timestamps_and_closes_database(monkeypatch)
     start = arrow.get('2024-01-01T00:00:00Z').int_timestamp * 1000
     state = {'range': None, 'counts': {}}
     fetches = []
-    stored = []
     progress = []
     driver = _FakeDriver(fetches)
     database_events = _configure_import(monkeypatch, state, driver, fixed_now)
 
-    def store(candles):
-        stored.extend(candles)
-        state['counts'][candles[0]['timestamp']] = len(candles)
-
-    monkeypatch.setattr(importer, 'store_candles_list', store)
     monkeypatch.setattr(importer, '_store_import_progress', lambda *values: progress.append(values))
 
     result = importer.run(
@@ -142,23 +153,25 @@ def test_import_paginates_with_exact_timestamps_and_closes_database(monkeypatch)
         ('BTC-USDT', start, '1m'),
         ('BTC-USDT', start + 720 * 60_000, '1m'),
     ]
-    assert len(stored) == 1440
-    assert stored[0]['timestamp'] == start
-    assert stored[-1]['timestamp'] == start + 1439 * 60_000
+    assert len(state['stored']) == 1440
+    assert state['stored'][0].timestamp == start
+    assert state['stored'][-1].timestamp == start + 1439 * 60_000
     assert progress and progress[0][0] == 'client-1'
     assert database_events == ['open', 'close']
-    assert '1.0 days imported' in result
+    assert '1440 observed candles' in result
 
 
 def test_import_resume_skips_complete_page_without_duplicate_fetch(monkeypatch):
     fixed_now = arrow.get('2024-01-02T00:00:00Z')
     start = arrow.get('2024-01-01T00:00:00Z').int_timestamp * 1000
-    state = {'range': None, 'counts': {start: 720}}
+    state = {
+        'range': None,
+        'counts': {},
+        'bounds': (start, start + 719 * 60_000),
+    }
     fetches = []
-    stored = []
     driver = _FakeDriver(fetches)
     _configure_import(monkeypatch, state, driver, fixed_now)
-    monkeypatch.setattr(importer, 'store_candles_list', lambda candles: stored.extend(candles))
     monkeypatch.setattr(importer, '_store_import_progress', lambda *values: None)
 
     result = importer.run(
@@ -166,10 +179,10 @@ def test_import_resume_skips_complete_page_without_duplicate_fetch(monkeypatch):
     )
 
     assert fetches == [('BTC-USDT', start + 720 * 60_000, '1m')]
-    assert len(stored) == 720
-    assert stored[0]['timestamp'] == start + 720 * 60_000
-    assert '0.5 days imported' in result
-    assert '0.5 days already existed' in result
+    assert len(state['stored']) == 720
+    assert state['stored'][0].timestamp == start + 720 * 60_000
+    assert '720 observed candles' in result
+    assert 'Existing rows were retained' in result
 
 
 def test_import_empty_response_raises_stable_error(monkeypatch):
@@ -179,49 +192,41 @@ def test_import_empty_response_raises_stable_error(monkeypatch):
     _configure_import(monkeypatch, state, driver, fixed_now)
     monkeypatch.setattr(driver, 'fetch', lambda *args, **kwargs: [])
 
-    with pytest.raises(exceptions.CandleNotFoundInExchange, match='No candles exists'):
+    with pytest.raises(exceptions.CandleNotFoundInExchange, match='No observed candles were returned'):
         importer.run(
             'client-3', driver.name, 'BTC-USDT', '2024-01-01', running_via_dashboard=False,
         )
 
 
-def test_dashboard_import_starts_and_stops_cancellation_checker(monkeypatch):
+def test_dashboard_import_checks_cancellation_in_active_path(monkeypatch):
     fixed_now = arrow.get('2024-01-02T00:00:00Z')
     start = arrow.get('2024-01-01T00:00:00Z').int_timestamp * 1000
     state = {'range': None, 'counts': {start: 1440}}
     driver = _FakeDriver([], count=1440)
     _configure_import(monkeypatch, state, driver, fixed_now)
     events = []
-    jobs = []
     published = []
-
-    class FakeTimeloop:
-        def job(self, interval):
-            def decorate(fn):
-                jobs.append(fn)
-                return fn
-
-            return decorate
-
-        def start(self):
-            events.append('checker-started')
-
-        def stop(self):
-            events.append('checker-stopped')
-
-    monkeypatch.setattr(importer, 'Timeloop', FakeTimeloop)
     monkeypatch.setattr(importer, 'register_custom_exception_handler', lambda: events.append('handler'))
     monkeypatch.setattr(importer.store.app, 'set_session_id', lambda value: events.append(('session', value)))
     monkeypatch.setattr(importer, 'sync_publish', lambda channel, payload: published.append((channel, payload)))
     monkeypatch.setattr(importer, '_store_import_progress', lambda *values: None)
+    monkeypatch.setattr(
+        importer,
+        'store_import_outcome',
+        lambda client_id, status, *args: events.append(('outcome', status)),
+    )
     monkeypatch.setattr(importer, 'is_process_active', lambda client_id: False)
 
-    importer.run('client-4', driver.name, 'BTC-USDT', '2024-01-01')
-
-    assert events == ['handler', ('session', 'client-4'), 'checker-started', 'checker-stopped']
-    assert [channel for channel, _ in published] == ['alert']
     with pytest.raises(exceptions.Termination):
-        jobs[0]()
+        importer.run('client-4', driver.name, 'BTC-USDT', '2024-01-01')
+
+    assert events == [
+        ('outcome', 'running'),
+        'handler',
+        ('session', 'client-4'),
+        ('outcome', 'cancelled'),
+    ]
+    assert published == []
 
 
 def test_import_progress_is_persisted_and_redis_failures_are_non_fatal(monkeypatch):
@@ -244,6 +249,69 @@ def test_import_progress_is_persisted_and_redis_failures_are_non_fatal(monkeypat
 
     monkeypatch.setattr(importer.sync_redis, 'set', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('down')))
     importer._store_import_progress('client-5', 50.0, 5.0, '2024-01-02')
+
+
+def test_import_outcome_round_trips_and_redis_failures_are_non_fatal(monkeypatch):
+    values = {}
+
+    class FakeRedis:
+        def set(self, key, value, ex=None):
+            values[key] = (value, ex)
+
+        def get(self, key):
+            stored = values.get(key)
+            return stored[0] if stored else None
+
+    monkeypatch.setattr(importer, 'sync_redis', FakeRedis())
+    monkeypatch.setattr(importer, 'ENV_VALUES', {'APP_PORT': '9100'})
+
+    importer.store_import_outcome(
+        'client-6',
+        'failed',
+        'RuntimeError: provider unavailable',
+        'serialized traceback',
+    )
+
+    assert importer.get_import_outcome('client-6') == {
+        'status': 'failed',
+        'error': 'RuntimeError: provider unavailable',
+        'traceback': 'serialized traceback',
+    }
+    assert values['9100|candle-import-outcome|client-6'][1] == 86400
+
+    monkeypatch.setattr(
+        importer.sync_redis,
+        'get',
+        lambda key: (_ for _ in ()).throw(OSError('down')),
+    )
+    assert importer.get_import_outcome('client-6') == {}
+
+
+def test_dashboard_import_failure_persists_typed_terminal_outcome(monkeypatch):
+    fixed_now = arrow.get('2024-01-02T00:00:00Z')
+    state = {'range': None, 'counts': {}}
+    driver = _FakeDriver([])
+    _configure_import(monkeypatch, state, driver, fixed_now)
+    outcomes = []
+    monkeypatch.setattr(driver, 'fetch', lambda *args, **kwargs: [])
+    monkeypatch.setattr(importer, 'register_custom_exception_handler', lambda: None)
+    monkeypatch.setattr(importer.store.app, 'set_session_id', lambda value: None)
+    monkeypatch.setattr(importer, 'is_process_active', lambda client_id: True)
+    monkeypatch.setattr(
+        importer,
+        'store_import_outcome',
+        lambda client_id, status, error=None, error_traceback=None: outcomes.append(
+            (status, error, error_traceback)
+        ),
+    )
+
+    with pytest.raises(exceptions.CandleNotFoundInExchange):
+        importer.run('client-7', driver.name, 'BTC-USDT', '2024-01-01')
+
+    assert outcomes[0] == ('running', None, None)
+    assert outcomes[1][0] == 'failed'
+    assert outcomes[1][1].startswith('CandleNotFoundInExchange:')
+    assert outcomes[1][1] in outcomes[1][2]
 
 
 def test_fill_absent_candles_uses_open_before_first_and_close_afterward():

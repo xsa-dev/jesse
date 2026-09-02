@@ -147,11 +147,23 @@ async def resume_monte_carlo(request_json: MonteCarloRequestJson):
 
     # Transform the session using the transformer
     transformed_session = get_monte_carlo_session_for_load_more(session)
+    stored_state = session.state_json if session.state else {}
+    stored_form = stored_state.get('form', {}) if isinstance(stored_state, dict) else {}
+    stored_config = stored_form.get('config') if isinstance(stored_form, dict) else None
+
+    # A resumed simulation must keep the assumptions of its original run. When the
+    # stored form has no config, the request payload supplies the required values.
+    resume_config = stored_config if isinstance(stored_config, dict) else request_json.config
+    resume_cpu_cores = (
+        resume_config.get('cpu_cores', request_json.cpu_cores)
+        if isinstance(resume_config, dict)
+        else request_json.cpu_cores
+    )
 
     process_manager.add_task(
         run_monte_carlo,
         request_json.id,
-        request_json.config,
+        resume_config,
         request_json.exchange,
         request_json.routes,
         request_json.data_routes,
@@ -161,10 +173,10 @@ async def resume_monte_carlo(request_json: MonteCarloRequestJson):
         request_json.run_candles,
         request_json.num_scenarios,
         request_json.fast_mode,
-        request_json.cpu_cores,
+        resume_cpu_cores,
         request_json.pipeline_type,
         request_json.pipeline_params,
-        request_json.state,
+        stored_state or request_json.state,
     )
 
     return JSONResponse({

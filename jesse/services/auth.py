@@ -1,7 +1,7 @@
 from hashlib import sha256
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import Header, HTTPException, Query
+from fastapi import Form, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from jesse.services.env import ENV_VALUES
 
@@ -13,12 +13,12 @@ class InvalidAuthError(HTTPException):
 
 def require_auth(authorization: Optional[str] = Header(None)) -> None:
     if not is_valid_token(authorization):
-        raise InvalidAuthError
+        raise InvalidAuthError()
 
 
 def require_auth_token(token: str = Query(...)) -> None:
     if not is_valid_token(token):
-        raise InvalidAuthError
+        raise InvalidAuthError()
 
 
 def require_auth_any(
@@ -26,7 +26,13 @@ def require_auth_any(
     authorization: Optional[str] = Header(None),
 ) -> None:
     if not is_valid_token(token or authorization):
-        raise InvalidAuthError
+        raise InvalidAuthError()
+
+
+def require_auth_form(token: Annotated[str, Form()]) -> None:
+    """Authenticate native form submissions that cannot attach an Authorization header."""
+    if not is_valid_token(token):
+        raise InvalidAuthError()
 
 
 def password_to_token(password: str) -> JSONResponse:

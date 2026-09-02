@@ -65,6 +65,11 @@ class order_types:
 @dataclass
 class exchanges:
     SANDBOX = 'Sandbox'
+    CUSTOM_DATA = 'Custom Data'
+    MASSIVE_STOCKS = 'Massive Stocks'
+    MASSIVE_CURRENCIES = 'Massive Currencies'
+    MASSIVE_INDICES = 'Massive Indices'
+    MASSIVE_FUTURES = 'Massive Futures'
     COINBASE_SPOT = 'Coinbase Spot'
     BITFINEX_SPOT = 'Bitfinex Spot'
     BINANCE_SPOT = 'Binance Spot'
@@ -98,6 +103,11 @@ class exchanges:
     KRAKEN_SPOT = 'Kraken Pro Spot'
     KRAKEN_PERPETUAL = 'Kraken Pro Futures'
     KRAKEN_PERPETUAL_TESTNET = 'Kraken Pro Futures Testnet'
+
+
+@dataclass
+class data_providers:
+    MASSIVE = 'Massive'
 
 
 @dataclass

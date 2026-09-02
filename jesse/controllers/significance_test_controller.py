@@ -57,9 +57,8 @@ async def significance_test(
         )
 
     if existing:
-        # Reuse a pre-staged draft (created via /significance-test/update-state by
-        # the dashboard, MCP, or other clients). Promote it to 'running' and refresh
-        # state/theme with whatever the start request carries.
+        # Keep the draft's identity while replacing its editable form with the
+        # exact state accepted for this run.
         update_significance_test_session_state(session_id, request_json.state)
         update_significance_test_session_status(session_id, 'running')
         if request_json.theme:

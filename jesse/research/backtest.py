@@ -1,10 +1,12 @@
 from typing import List, Dict
 import os
+import sys
 import uuid
 import numpy as np
 from jesse.services import candle_service, exchange_service, order_service, position_service
 from jesse.services import charts
 from jesse.services.validators import validate_routes
+from jesse.services.simulation_assumptions import resolve_annualization
 from jesse.modes.backtest_mode import simulator
 from jesse.config import config as jesse_config, reset_config, set_config
 from jesse.routes import router
@@ -12,57 +14,39 @@ from jesse.store import store
 import jesse.helpers as jh 
 
 
-def _validate_contiguous_one_minute_candles(candles: dict) -> None:
-    """Validate the complete 1m source timeline required by research backtests.
-
-    Route timeframes may be higher than 1m, but Jesse generates those candles
-    from the supplied 1m data later in the simulation. Accepting an incomplete
-    source timeline would therefore make aggregation and execution mode-dependent.
-    """
-    # Jesse candle timestamps are milliseconds, so adjacent source candles must
-    # always be exactly 60 seconds apart regardless of the route timeframe.
-    one_minute_ms = 60_000
-
+def _validate_observed_one_minute_candles(candles: dict) -> None:
+    """Validate provider-observed source rows before mutating research runtime state."""
+    if not candles:
+        raise ValueError('At least one observed candle series is required.')
     for candle_data in candles.values():
-        candle_set = candle_data['candles']
-        exchange = candle_data['exchange']
-        symbol = candle_data['symbol']
+        candle_service.validate_observed_one_minute_candles(
+            candle_data['candles'],
+            candle_data['exchange'],
+            candle_data['symbol'],
+        )
 
-        if len(candle_set) < 2:
-            raise ValueError(
-                f'At least two continuous 1m candles are required for {symbol} on {exchange}.'
-            )
 
-        # Inspect every adjacent pair so a gap anywhere in the source timeline
-        # is rejected before higher-timeframe candles are generated.
-        timestamp_differences = np.diff(candle_set[:, 0])
-        invalid_indices = np.flatnonzero(timestamp_differences != one_minute_ms)
+def _validate_contiguous_one_minute_candles(candles: dict) -> None:
+    """Retain dense-only validation for research engines not yet migrated to timestamp replay."""
+    _validate_observed_one_minute_candles(candles)
+    for candle_data in candles.values():
+        differences = np.diff(candle_data['candles'][:, 0])
+        invalid_indices = np.flatnonzero(differences != 60_000)
         if len(invalid_indices) == 0:
             continue
-
-        # Report the first broken interval so the caller gets a deterministic,
-        # actionable location even when the provider response has multiple gaps.
-        previous_index = int(invalid_indices[0])
-        previous_timestamp = int(candle_set[previous_index][0])
-        actual_timestamp = int(candle_set[previous_index + 1][0])
-        expected_timestamp = previous_timestamp + one_minute_ms
+        index = int(invalid_indices[0])
+        previous_timestamp = int(candle_data['candles'][index, 0])
+        actual_timestamp = int(candle_data['candles'][index + 1, 0])
         difference = actual_timestamp - previous_timestamp
-
-        # A forward, minute-aligned jump represents absent 1m rows. Duplicates,
-        # reversed rows, and non-minute-aligned timestamps use the generic error.
-        if difference > one_minute_ms and difference % one_minute_ms == 0:
-            missing_count = difference // one_minute_ms - 1
+        if difference > 60_000 and difference % 60_000 == 0:
+            missing_count = difference // 60_000 - 1
             candle_word = 'candle' if missing_count == 1 else 'candles'
             raise ValueError(
-                f'Missing {missing_count} one-minute {candle_word} for {symbol} on {exchange}. '
-                f'Expected timestamp {expected_timestamp} after {previous_timestamp}, '
-                f'but got {actual_timestamp}.'
+                f'Missing {missing_count} one-minute {candle_word} for '
+                f"{candle_data['symbol']} on {candle_data['exchange']}."
             )
-
         raise ValueError(
-            f'Candles for {symbol} on {exchange} must have strictly increasing '
-            f'1m timestamps. Expected {expected_timestamp} after {previous_timestamp}, '
-            f'but got {actual_timestamp}.'
+            f"Candles for {candle_data['symbol']} on {candle_data['exchange']} must be continuous 1m rows."
         )
 
 
@@ -94,6 +78,8 @@ def backtest(
         'starting_balance': 5_000,
         'fee': 0.005,
         'type': 'futures',
+        'simulation_model': 'perpetual_futures',
+        'annualization': 365,
         'futures_leverage': 3,
         'futures_leverage_mode': 'cross',
         'exchange': 'Binance',
@@ -136,6 +122,19 @@ def backtest(
     )
 
 
+def _reset_research_runtime_state() -> None:
+    """Restore every process-wide service owned by a research run."""
+    reset_config()
+    router._reset()
+    store.reset()
+
+    # Avoid constructing the API singleton while no routes are configured. If
+    # it already exists, its sandbox drivers belong to the completed session.
+    api_module = sys.modules.get('jesse.services.api')
+    if api_module is not None:
+        api_module.api.reset_drivers()
+
+
 def _isolated_backtest(
         config: dict,
         routes: List[Dict[str, str]],
@@ -155,10 +154,53 @@ def _isolated_backtest(
         candles_pipeline_kwargs: dict = None,
         generate_charts: bool = False,
 ) -> dict:
-    # Research backtests require complete 1m source data. Running validation
-    # before configuration, routes, or stores are mutated guarantees that fast
-    # and step simulation reject malformed input identically without leaked state.
-    _validate_contiguous_one_minute_candles(candles)
+    # Validate before configuration, routes, or stores are mutated so both execution modes fail identically.
+    _validate_observed_one_minute_candles(candles)
+
+    _reset_research_runtime_state()
+    try:
+        return _execute_isolated_backtest(
+            config,
+            routes,
+            data_routes,
+            candles,
+            warmup_candles,
+            run_silently=run_silently,
+            hyperparameters=hyperparameters,
+            generate_csv=generate_csv,
+            generate_json=generate_json,
+            generate_equity_curve=generate_equity_curve,
+            benchmark=benchmark,
+            generate_hyperparameters=generate_hyperparameters,
+            generate_logs=generate_logs,
+            fast_mode=fast_mode,
+            candles_pipeline_class=candles_pipeline_class,
+            candles_pipeline_kwargs=candles_pipeline_kwargs,
+            generate_charts=generate_charts,
+        )
+    finally:
+        _reset_research_runtime_state()
+
+
+def _execute_isolated_backtest(
+        config: dict,
+        routes: List[Dict[str, str]],
+        data_routes: List[Dict[str, str]],
+        candles: dict,
+        warmup_candles: dict = None,
+        run_silently: bool = True,
+        hyperparameters: dict = None,
+        generate_csv: bool = False,
+        generate_json: bool = False,
+        generate_equity_curve: bool = False,
+        benchmark: bool = False,
+        generate_hyperparameters: bool = False,
+        generate_logs: bool = False,
+        fast_mode: bool = False,
+        candles_pipeline_class = None,
+        candles_pipeline_kwargs: dict = None,
+        generate_charts: bool = False,
+) -> dict:
 
     jesse_config['app']['trading_mode'] = 'backtest'
 
@@ -173,6 +215,7 @@ def _isolated_backtest(
     validate_routes(router)
     # initiate candle store
     store.candles.init_storage(5000)
+    store.candles.enforce_warmup = jesse_config['env']['data']['warmup_candles_num'] > 0
     # initialize exchanges state
     exchange_service.initialize_exchanges_state()
     # initialize orders state
@@ -189,13 +232,19 @@ def _isolated_backtest(
 
     # if warmup_candles is passed, use it
     if warmup_candles:
+        # The latest instrument start is the first boundary shared by every stream.
+        initial_common_start = max(
+            int(candle_data['candles'][0, 0])
+            for candle_data in trading_candles_dict.values()
+        )
         for c in jesse_config['app']['considering_candles']:
             key = jh.key(c[0], c[1])
             # inject warm-up candles
             candle_service.inject_warmup_candles_to_store(
                 warmup_candles_dict[key]['candles'],
                 c[0],
-                c[1]
+                c[1],
+                available_at=initial_common_start,
             )
 
     # run backtest simulation
@@ -227,13 +276,19 @@ def _isolated_backtest(
         backtest_result['charts_session_id'] = _session_id
         backtest_result['charts_folder'] = _charts_folder
 
+    empty_metrics = {
+        'total': 0,
+        'win_rate': 0,
+        'net_profit_percentage': 0,
+        'annualization': int(resolve_annualization(config)),
+    }
     result = {
-        'metrics': {'total': 0, 'win_rate': 0, 'net_profit_percentage': 0},
+        'metrics': empty_metrics,
         'logs': None,
     }
 
     if backtest_result['metrics'] is None:
-        result['metrics'] = {'total': 0, 'win_rate': 0, 'net_profit_percentage': 0}
+        result['metrics'] = empty_metrics
     else:
         result['metrics'] = backtest_result['metrics']
 
@@ -255,10 +310,6 @@ def _isolated_backtest(
     if 'trades' in backtest_result:
         result['trades'] = backtest_result['trades']
 
-    # reset store and config so rerunning would be flawlessly possible
-    reset_config()
-    store.reset()
-
     return result
 
 
@@ -267,10 +318,19 @@ def _format_config(config):
     Jesse's required format for user_config is different from what this function accepts (so it
     would be easier to write for the researcher). Hence, we need to reformat the config_dict:
     """
+    from jesse.services.simulation_assumptions import (
+        legacy_type_from_simulation_model,
+        resolve_simulation_model,
+    )
+
+    simulation_model = resolve_simulation_model(config, config.get('type', 'futures'))
+    exchange_type = legacy_type_from_simulation_model(simulation_model)
     exchange_config = {
         'balance': config['starting_balance'],
         'fee': config['fee'],
-        'type': config['type'],
+        'type': exchange_type,
+        'simulation_model': simulation_model.value,
+        'annualization': int(resolve_annualization(config)),
         'name': config['exchange'],
     }
     # futures exchange has different config, so:

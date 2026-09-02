@@ -11,9 +11,231 @@ code organization and reusability.
 import requests
 import uuid
 from hashlib import sha256
-from typing import Optional
+from pathlib import Path
+from tempfile import TemporaryFile
+from typing import Literal, Optional
 from .auth import hash_password
 import jesse.mcp.mcp_config as mcp_config
+from jesse.services.custom_candle_import import CustomCandleImportError, clean_custom_candle_csv
+
+
+# Multi-year CSV validation can outlast ordinary MCP reads, but remains bounded for a stalled backend.
+CUSTOM_CSV_REQUEST_TIMEOUT_SECONDS = 300
+
+
+def _custom_csv_path(file_path: str) -> Path:
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        raise ValueError('file_path must be an absolute path')
+    path = path.resolve(strict=True)
+    if not path.is_file() or path.suffix.lower() != '.csv':
+        raise ValueError('file_path must point to a CSV file')
+    return path
+
+
+def _custom_csv_form(symbol: str) -> dict[str, str]:
+    return {
+        'symbol': symbol,
+        'timestamp_format': 'unix_ms',
+        'timestamp_column': 'timestamp',
+        'open_column': 'open',
+        'close_column': 'close',
+        'high_column': 'high',
+        'low_column': 'low',
+        'volume_column': 'volume',
+    }
+
+
+def _clean_custom_csv(
+    file_path: str,
+    timestamp_format: str,
+    timestamp_column: str,
+    open_column: str,
+    close_column: str,
+    high_column: str,
+    low_column: str,
+    volume_column: str,
+    invalid_row_policy: Literal['reject', 'drop'],
+):
+    path = _custom_csv_path(file_path)
+    cleaned_file = TemporaryFile(mode='w+b')
+    try:
+        with path.open('rb') as source_file:
+            report = clean_custom_candle_csv(
+                source_file,
+                cleaned_file,
+                timestamp_format,
+                {
+                    'timestamp': timestamp_column,
+                    'open': open_column,
+                    'close': close_column,
+                    'high': high_column,
+                    'low': low_column,
+                    'volume': volume_column,
+                },
+                invalid_row_policy,
+            )
+        cleaned_file.seek(0)
+        return cleaned_file, report
+    except Exception:
+        cleaned_file.close()
+        raise
+
+
+def preview_custom_candle_csv_service(
+    file_path: str,
+    symbol: str,
+    timestamp_format: str = 'auto',
+    timestamp_column: str = 'timestamp',
+    open_column: str = 'open',
+    close_column: str = 'close',
+    high_column: str = 'high',
+    low_column: str = 'low',
+    volume_column: str = 'volume',
+) -> dict:
+    """Preview deterministic cleanup and verify the normalized output with Jesse's import API."""
+    try:
+        cleaned_file, report = _clean_custom_csv(
+            file_path,
+            timestamp_format,
+            timestamp_column,
+            open_column,
+            close_column,
+            high_column,
+            low_column,
+            volume_column,
+            'drop',
+        )
+        try:
+            backend_preview = None
+            if report['can_import_with_drop']:
+                response = requests.post(
+                    f'{mcp_config.JESSE_API_URL}/candles/custom/preview',
+                    data=_custom_csv_form(symbol),
+                    files={'file': ('cleaned-candles.csv', cleaned_file, 'text/csv')},
+                    headers={'Authorization': hash_password(mcp_config.JESSE_PASSWORD)},
+                    timeout=CUSTOM_CSV_REQUEST_TIMEOUT_SECONDS,
+                )
+                if response.status_code != 200:
+                    return {
+                        'status': 'error',
+                        'action': 'custom_candle_csv_preview_failed',
+                        'error_type': 'api_error',
+                        'cleaning_report': report,
+                        'message': f'Jesse rejected the normalized CSV: {response.text}',
+                    }
+                backend_preview = response.json().get('data')
+            return {
+                'status': 'success',
+                'action': 'custom_candle_csv_previewed',
+                'file_path': str(_custom_csv_path(file_path)),
+                'symbol': symbol.strip().upper(),
+                'cleaning_report': report,
+                'import_preview': backend_preview,
+                'message': (
+                    'Preview complete. Choose invalid_row_policy="reject" or "drop" when importing; '
+                    'conflicting duplicate timestamps must be fixed in the source file.'
+                ),
+            }
+        finally:
+            cleaned_file.close()
+    except (CustomCandleImportError, OSError, ValueError) as exc:
+        return {
+            'status': 'error',
+            'action': 'custom_candle_csv_preview_failed',
+            'error_type': 'validation_error',
+            'message': str(exc),
+        }
+    except requests.RequestException as exc:
+        return {
+            'status': 'error',
+            'action': 'custom_candle_csv_preview_failed',
+            'error_type': 'network_error',
+            'message': f'Could not reach Jesse: {exc}',
+        }
+
+
+def clean_and_import_custom_candle_csv_service(
+    file_path: str,
+    symbol: str,
+    invalid_row_policy: Literal['reject', 'drop'],
+    timestamp_format: str = 'auto',
+    timestamp_column: str = 'timestamp',
+    open_column: str = 'open',
+    close_column: str = 'close',
+    high_column: str = 'high',
+    low_column: str = 'low',
+    volume_column: str = 'volume',
+) -> dict:
+    """Clean one local CSV and import its canonical rows through Jesse's custom-data endpoint."""
+    try:
+        cleaned_file, report = _clean_custom_csv(
+            file_path,
+            timestamp_format,
+            timestamp_column,
+            open_column,
+            close_column,
+            high_column,
+            low_column,
+            volume_column,
+            invalid_row_policy,
+        )
+        try:
+            if not report['valid']:
+                return {
+                    'status': 'error',
+                    'action': 'custom_candle_csv_import_failed',
+                    'error_type': 'validation_error',
+                    'cleaning_report': report,
+                    'message': (
+                        'The selected cleaning policy cannot safely import this file. '
+                        'Review invalid rows or conflicting duplicate timestamps.'
+                    ),
+                }
+            response = requests.post(
+                f'{mcp_config.JESSE_API_URL}/candles/custom/import',
+                data=_custom_csv_form(symbol),
+                files={'file': ('cleaned-candles.csv', cleaned_file, 'text/csv')},
+                headers={'Authorization': hash_password(mcp_config.JESSE_PASSWORD)},
+                timeout=CUSTOM_CSV_REQUEST_TIMEOUT_SECONDS,
+            )
+            if response.status_code != 201:
+                return {
+                    'status': 'error',
+                    'action': 'custom_candle_csv_import_failed',
+                    'error_type': 'api_error',
+                    'cleaning_report': report,
+                    'message': f'Jesse rejected the normalized CSV: {response.text}',
+                }
+            imported = response.json().get('data', {})
+            return {
+                'status': 'success',
+                'action': 'custom_candle_csv_imported',
+                'exchange': imported.get('exchange', 'Custom Data'),
+                'symbol': imported.get('symbol', symbol.strip().upper()),
+                'timeframe': '1m',
+                'cleaning_report': report,
+                'import_report': imported,
+                'message': (
+                    f'Imported {report["cleaned_row_count"]} cleaned one-minute candles as Custom Data.'
+                ),
+            }
+        finally:
+            cleaned_file.close()
+    except (CustomCandleImportError, OSError, ValueError) as exc:
+        return {
+            'status': 'error',
+            'action': 'custom_candle_csv_import_failed',
+            'error_type': 'validation_error',
+            'message': str(exc),
+        }
+    except requests.RequestException as exc:
+        return {
+            'status': 'error',
+            'action': 'custom_candle_csv_import_failed',
+            'error_type': 'network_error',
+            'message': f'Could not reach Jesse: {exc}',
+        }
 
 
 def import_candles_service(
@@ -68,7 +290,7 @@ def import_candles_service(
                 "exchange": exchange,
                 "symbol": symbol,
                 "start_date": start_date,
-                "message": f"Candle import started for {symbol} on {exchange}. Poll get_existing_candles() to confirm completion, or cancel_candle_import(import_id) to stop it."
+                "message": f"Candle import started for {symbol} on {exchange}. Poll get_candle_import_status(import_id) until it reaches a terminal state."
             }
         else:
             return {
@@ -295,7 +517,7 @@ def get_candle_import_status_service(import_id: str) -> dict:
         import_id: The import process ID returned by import_candles()
 
     Returns:
-        {"status": "running"|"finished", "import_id": "...", ...}
+        {"status": "running"|"finished"|"failed"|"cancelled", "import_id": "...", ...}
     """
     api_url = mcp_config.JESSE_API_URL
     password = mcp_config.JESSE_PASSWORD
@@ -317,6 +539,14 @@ def get_candle_import_status_service(import_id: str) -> dict:
                 "import_id": import_id,
                 "message": f"Import {import_id} is {data.get('status')}."
             }
+            if data.get('error') is not None:
+                result['error'] = data['error']
+                result['message'] = f"Import {import_id} failed: {data['error']}"
+            if data.get('traceback') is not None:
+                result['traceback'] = data['traceback']
+            if data.get('result') is not None:
+                result['result'] = data['result']
+                result['message'] = data['result'].get('message', result['message'])
             # Surface live progress (percent complete, ETA, date reached so far) while
             # the import runs, so the caller sees it advancing instead of a blind "running".
             progress = data.get("progress")

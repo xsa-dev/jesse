@@ -1,7 +1,16 @@
+from copy import deepcopy
+
 import jesse.helpers as jh
 from jesse.modes.utils import get_exchange_type
 from jesse.enums import exchanges
 from jesse.info import exchange_info
+from jesse.services.simulation_assumptions import (
+    Annualization,
+    legacy_type_from_simulation_model,
+    resolve_annualization,
+    resolve_simulation_model,
+    simulation_model_from_legacy_type,
+)
 
 # Main configuration used by the Jesse framework. These values are modified
 # at runtime based on the mode (backtest, live, or optimize) and user settings.
@@ -32,6 +41,7 @@ config = {
             exchanges.SANDBOX: {
                 'fee': 0,
                 'type': 'futures',
+                'annualization': 365,
                 # accepted values are: 'cross' and 'isolated'
                 'futures_leverage_mode': 'cross',
                 # 1x, 2x, 10x, 50x, etc. Enter as integers
@@ -66,6 +76,10 @@ config = {
             'warmup_candles_num': 240,
             'generate_candles_from_1m': False,
             'persistency': True,
+        },
+
+        'metrics': {
+            'annualization': 365,
         },
     },
 
@@ -107,6 +121,7 @@ for key in exchange_info:
     config['env']['exchanges'][key] = {
         'fee': exchange_info[key]['fee'],
         'type': exchange_info[key]['type'],
+        'annualization': resolve_annualization(exchange_info[key]),
         'futures_leverage_mode': 'cross',
         'futures_leverage': 1,
         'balance': 10_000
@@ -136,6 +151,7 @@ def set_config(conf: dict) -> None:
         # logs
         config['env']['logging'] = conf['logging']
         # exchanges
+        selected_annualization = None
         for key, e in conf['exchanges'].items():
             # The dashboard sends each exchange entry carrying its own 'name', but the
             # exchanges map is keyed by exchange name and scripted/MCP callers pass the
@@ -145,13 +161,25 @@ def set_config(conf: dict) -> None:
             # backtest/RST worker, which then exited silently (the traceback was lost on
             # the os._exit() that follows), leaving the MCP/dashboard session stuck.
             name = e.get('name') or key
-            if not jh.is_live() and e['type']:
-                exchange_type = e['type']
+            if jh.is_livetrading():
+                simulation_model = simulation_model_from_legacy_type(get_exchange_type(name))
+                annualization = resolve_annualization(exchange_info[name])
             else:
-                exchange_type = get_exchange_type(name)
+                default_type = exchange_info.get(name, {}).get(
+                    'type',
+                    config['env']['exchanges'].get(name, {}).get('type', 'futures'),
+                )
+                simulation_model = resolve_simulation_model(e, default_type)
+                annualization = resolve_annualization(e)
+            exchange_type = legacy_type_from_simulation_model(simulation_model)
+            if selected_annualization is not None and selected_annualization != annualization:
+                raise ValueError('All exchanges in one run must use the same annualization assumption')
+            selected_annualization = annualization
             config['env']['exchanges'][name] = {
                 'fee': float(e['fee']),
                 'type': exchange_type,
+                'simulation_model': simulation_model.value,
+                'annualization': int(annualization),
                 'balance': float(e['balance'])
             }
             if config['env']['exchanges'][name]['type'] == 'futures':
@@ -159,6 +187,8 @@ def set_config(conf: dict) -> None:
                 config['env']['exchanges'][name]['futures_leverage'] = int(e.get('futures_leverage', 1))
                 # accepted values are: 'cross' and 'isolated'
                 config['env']['exchanges'][name]['futures_leverage_mode'] = e.get('futures_leverage_mode', 'cross')
+        if selected_annualization is not None:
+            config['env']['metrics']['annualization'] = int(selected_annualization)
 
     # live mode only
     if jh.is_live():
@@ -171,8 +201,11 @@ def set_config(conf: dict) -> None:
 
 
 def reset_config() -> None:
-    global config
-    config = backup_config.copy()
+    # Modules import this dictionary directly, so resetting must preserve its
+    # identity while replacing every nested runtime mutation.
+    config.clear()
+    config.update(deepcopy(backup_config))
+    jh.clear_config_caches()
 
 
-backup_config = config.copy()
+backup_config = deepcopy(config)

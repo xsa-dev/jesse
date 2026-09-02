@@ -40,6 +40,7 @@ from typing import Optional
 
 import jesse.mcp.mcp_config as mcp_config
 from .auth import hash_password
+from .session_config import load_session_run_config, optimization_engine_config
 
 
 def _default_cpu_cores() -> int:
@@ -47,42 +48,6 @@ def _default_cpu_cores() -> int:
         return max(1, min(cpu_count() - 1, 4))
     except Exception:
         return 2
-
-
-def _default_optimize_config(
-    exchange_name: Optional[str],
-    objective_function: str = 'sharpe',
-    trials: int = 200,
-    best_candidates_count: int = 20,
-    warm_up_candles: int = 210,
-) -> dict:
-    """
-    Build the config payload the optimize runner expects.
-
-    The optimize mode's set_config() reads `objective_function`, `warm_up_candles`,
-    `trials`, and `best_candidates_count` off this dict (warm_up_candles and trials
-    are read unconditionally, so they must always be present). The Optimizer also
-    reads `config['exchange']['type'|'futures_leverage'|'futures_leverage_mode']`
-    unconditionally, so those exchange keys must always be present too (even for a
-    spot exchange) to avoid a KeyError inside the spawned worker.
-    """
-    name = (exchange_name or '').lower()
-    is_spot = 'spot' in name
-    exchange = {
-        'balance': 10_000,
-        'fee': 0.0006,
-        'type': 'spot' if is_spot else 'futures',
-        # Always present — Optimize.py indexes these regardless of exchange type.
-        'futures_leverage': 1,
-        'futures_leverage_mode': 'cross',
-    }
-    return {
-        'warm_up_candles': int(warm_up_candles),
-        'trials': int(trials),
-        'objective_function': objective_function or 'sharpe',
-        'best_candidates_count': int(best_candidates_count),
-        'exchange': exchange,
-    }
 
 
 def _build_default_title(routes_list: list) -> str:
@@ -238,9 +203,18 @@ def create_optimization_draft_service(
                     'message': f'Unsupported objective_function "{objective_function}". '
                                'Use one of: sharpe, calmar, sortino, omega, serenity, smart sharpe, smart sortino.'}
 
-        # The form stores both the run parameters and the optimization knobs
-        # (objective_function/trials/best_candidates_count/warm_up_candles) so the
-        # run step can rebuild the config dict without a separate config store.
+        run_config = load_session_run_config(
+            'optimization',
+            exchange,
+            {
+                'objective_function': objective_function or 'sharpe',
+                'trials': int(trials),
+                'best_candidates_count': int(best_candidates_count),
+                'warm_up_candles': int(warm_up_candles),
+                'cpu_cores': int(cpu_cores) if cpu_cores is not None else _default_cpu_cores(),
+            },
+        )
+
         form_data = {
             'id': session_id,
             'exchange': exchange,
@@ -252,18 +226,11 @@ def create_optimization_draft_service(
             'testing_finish_date': testing_finish_date,
             'optimal_total': int(optimal_total),
             'fast_mode': bool(fast_mode),
-            'cpu_cores': int(cpu_cores) if cpu_cores is not None else _default_cpu_cores(),
-            'objective_function': objective_function or 'sharpe',
-            'trials': int(trials),
-            'best_candidates_count': int(best_candidates_count),
-            'warm_up_candles': int(warm_up_candles),
+            'config': run_config,
         }
 
-        # Persist the FULL results shape the dashboard's optimization store expects (see
-        # dashboard-v1 stores/optimizationStore.ts state()). The frontend's loadSession patches
-        # this state in and then reads nested objects directly (results.progressbar.current,
-        # results.exception.error); a partial shape here left those undefined and crashed
-        # "Failed to load session". Keep this in sync with the store's default results.
+        # Keep this complete results shape aligned with the Dashboard store because
+        # session loading reads nested progress, exception, and result fields directly.
         state_dict = {
             'form': form_data,
             'results': {
@@ -527,26 +494,39 @@ def get_optimization_logs_service(session_id: str) -> dict:
 
 
 def _build_run_payload(session_id: str, form: dict, state: dict) -> dict:
-    config = _default_optimize_config(
+    legacy_overrides = {
+        key: form[key]
+        for key in (
+            'objective_function',
+            'trials',
+            'best_candidates_count',
+            'warm_up_candles',
+            'cpu_cores',
+        )
+        if key in form
+    }
+    if isinstance(form.get('config'), dict):
+        legacy_overrides.update(form['config'])
+    run_config = load_session_run_config(
+        'optimization',
         form.get('exchange'),
-        objective_function=form.get('objective_function', 'sharpe'),
-        trials=form.get('trials', 200),
-        best_candidates_count=form.get('best_candidates_count', 20),
-        warm_up_candles=form.get('warm_up_candles', 210),
+        legacy_overrides,
     )
+    form['config'] = run_config
+    state['form'] = form
     return {
         'id': session_id,
         'exchange': form.get('exchange'),
         'routes': form.get('routes', []),
         'data_routes': form.get('data_routes', []),
-        'config': config,
+        'config': optimization_engine_config(run_config),
         'training_start_date': form.get('training_start_date'),
         'training_finish_date': form.get('training_finish_date'),
         'testing_start_date': form.get('testing_start_date'),
         'testing_finish_date': form.get('testing_finish_date'),
         'optimal_total': int(form.get('optimal_total', 50)),
         'fast_mode': bool(form.get('fast_mode', True)),
-        'cpu_cores': int(form.get('cpu_cores', _default_cpu_cores())),
+        'cpu_cores': int(run_config['cpu_cores']),
         'state': state if isinstance(state, dict) else {},
     }
 

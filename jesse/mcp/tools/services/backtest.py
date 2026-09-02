@@ -24,6 +24,7 @@ from jesse.services.web import (
 )
 from pydantic import ValidationError
 from .auth import hash_password
+from .session_config import backtest_engine_config, load_session_run_config
 
 
 def _build_default_backtest_title(routes_list: list) -> str:
@@ -280,6 +281,8 @@ def create_backtest_draft_service(
             # Fallback to defaults if no routes provided
             selected_route = {"symbol": "BTC-USDT", "timeframe": "4h", "strategy": "ExampleStrategy"}
 
+        run_config = load_session_run_config('backtest', exchange)
+
         # Create complete state structure
         state_dict = {
             'form': {
@@ -293,7 +296,8 @@ def create_backtest_draft_service(
                 'export_json': export_json,
                 'export_chart': export_chart,
                 'fast_mode': fast_mode,
-                'benchmark': benchmark
+                'benchmark': benchmark,
+                'config': run_config,
             },
             'results': {
                 'showResults': False,
@@ -778,14 +782,21 @@ def run_backtest_service(session_id: str) -> dict:
 
         form_data = json.loads(form) if isinstance(form, str) else form
 
-        # Load current backtest config from Jesse
-        from .config import get_backtest_config_service
-        config_result = get_backtest_config_service()
-        if config_result['status'] != 'success':
-            return {'status': 'error', 'message': f'Failed to load backtest config: {config_result.get("message", "Unknown error")}'}
-        backtest_config = config_result['config']
+        run_config = load_session_run_config(
+            'backtest',
+            form_data.get('exchange'),
+            form_data.get('config'),
+        )
+        form_data['config'] = run_config
+        state['form'] = form_data
+        backtest_config = backtest_engine_config(run_config)
 
-        backtest_request_dict = {**form_data, 'config': backtest_config, 'id': session_id}
+        backtest_request_dict = {
+            **form_data,
+            'config': backtest_config,
+            'id': session_id,
+            'state': state,
+        }
 
         try:
             backtest_req = BacktestRequestJson(**backtest_request_dict)
@@ -812,20 +823,10 @@ def run_backtest_service(session_id: str) -> dict:
                 'timeframe': first_route.get('timeframe', ''),
                 'strategy': first_route.get('strategy', '')
             }
-        state_response = requests.post(
-            f'{api_url}/backtest/update-state',
-            json={
-                'id': session_id,
-                'state': state
-            },
-            headers={'Authorization': auth_token_hashed},
-            timeout=10
-        )
 
-        if state_response.status_code == 401:
-            return {'status': 'error', 'message': 'Authentication failed'}
-        if state_response.status_code != 200:
-            return {'status': 'error', 'message': f'Failed to save executed routes: {state_response.text}'}
+        # Starting the run and storing its finalized form must be one request so
+        # the session history cannot describe a different configuration.
+        payload['state'] = state
 
         # Fire the backtest and return immediately
         response = requests.post(

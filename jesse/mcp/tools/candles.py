@@ -6,6 +6,8 @@ This module provides MCP tools for managing Jesse candle data,
 using the candle controller endpoints like the dashboard does.
 
 The tools include:
+- preview_custom_candle_csv: Preview deterministic cleanup of a local CSV
+- clean_and_import_custom_candle_csv: Clean and import a local CSV as Custom Data
 - import_candles: Import historical candle data for a symbol
 - cancel_candle_import: Cancel an ongoing candle import process
 - clear_candle_cache: Clear the candles database cache
@@ -17,7 +19,7 @@ For real-time import progress monitoring, use get_candle_import_progress from ev
 All tools require authentication via Jesse admin password.
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 from jesse.mcp.tools.services.candles import (
     import_candles_service,
@@ -26,7 +28,9 @@ from jesse.mcp.tools.services.candles import (
     get_candles_service,
     get_candle_import_status_service,
     get_existing_candles_service,
-    delete_candles_service
+    delete_candles_service,
+    preview_custom_candle_csv_service,
+    clean_and_import_custom_candle_csv_service,
 )
 
 
@@ -42,6 +46,72 @@ def register_candles_tools(mcp):
     """
 
     @mcp.tool()
+    def preview_custom_candle_csv(
+        file_path: str,
+        symbol: str,
+        timestamp_format: str = 'auto',
+        timestamp_column: str = 'timestamp',
+        open_column: str = 'open',
+        close_column: str = 'close',
+        high_column: str = 'high',
+        low_column: str = 'low',
+        volume_column: str = 'volume',
+    ) -> dict:
+        """Preview how Jesse MCP would clean a local one-minute candle CSV.
+
+        The path must be absolute. The preview canonicalizes mapped headers, converts timestamps
+        to Unix milliseconds, sorts rows, removes identical duplicate timestamps, and reports
+        invalid or conflicting rows without importing anything. Missing minutes remain gaps.
+
+        After reviewing `cleaning_report`, call clean_and_import_custom_candle_csv and explicitly
+        choose `invalid_row_policy="reject"` or `"drop"`.
+        """
+        return preview_custom_candle_csv_service(
+            file_path=file_path,
+            symbol=symbol,
+            timestamp_format=timestamp_format,
+            timestamp_column=timestamp_column,
+            open_column=open_column,
+            close_column=close_column,
+            high_column=high_column,
+            low_column=low_column,
+            volume_column=volume_column,
+        )
+
+    @mcp.tool()
+    def clean_and_import_custom_candle_csv(
+        file_path: str,
+        symbol: str,
+        invalid_row_policy: Literal['reject', 'drop'],
+        timestamp_format: str = 'auto',
+        timestamp_column: str = 'timestamp',
+        open_column: str = 'open',
+        close_column: str = 'close',
+        high_column: str = 'high',
+        low_column: str = 'low',
+        volume_column: str = 'volume',
+    ) -> dict:
+        """Clean and atomically import a local CSV as `Custom Data / SYMBOL / 1m`.
+
+        Use `reject` to fail when any row is invalid. Use `drop` only after reviewing the preview;
+        malformed rows are omitted and reported. Both policies sort timestamps and remove identical
+        duplicates. Conflicting candles at one timestamp always fail, and gaps are never filled.
+        The source file is never modified.
+        """
+        return clean_and_import_custom_candle_csv_service(
+            file_path=file_path,
+            symbol=symbol,
+            invalid_row_policy=invalid_row_policy,
+            timestamp_format=timestamp_format,
+            timestamp_column=timestamp_column,
+            open_column=open_column,
+            close_column=close_column,
+            high_column=high_column,
+            low_column=low_column,
+            volume_column=volume_column,
+        )
+
+    @mcp.tool()
     def import_candles(
         exchange: str,
         symbol: str,
@@ -54,7 +124,8 @@ def register_candles_tools(mcp):
         Starts the import for the given exchange/symbol and returns as soon as Jesse
         acknowledges the request. Does NOT wait for the import to finish.
         Poll get_candle_import_status(import_id) every few seconds until "finished",
-        then optionally verify with get_existing_candles(). Use cancel_candle_import(import_id) to stop it.
+        "failed", or "cancelled". After "finished", optionally verify with
+        get_existing_candles(). Use cancel_candle_import(import_id) to stop it.
 
         All supported timeframes are imported automatically: 1m, 3m, 5m, 15m, 30m,
         45m, 1h, 2h, 3h, 4h, 6h, 8h, 12h, 1D, 3D, 1W, 1M.
@@ -224,7 +295,7 @@ def register_candles_tools(mcp):
             >>> import time
             >>> while True:
             ...     status = get_candle_import_status(import_id)
-            ...     if status["status"] == "finished":
+            ...     if status["status"] in {"finished", "failed", "cancelled"}:
             ...         break
             ...     time.sleep(5)
         """
@@ -597,4 +668,3 @@ def register_candles_tools(mcp):
             >>> print(f"BTC datasets remaining: {len(btc_data)}")  # Should be 0
         """
         return delete_candles_service(exchange=exchange, symbol=symbol)
-

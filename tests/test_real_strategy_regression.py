@@ -158,41 +158,10 @@ def _fingerprint(result: dict) -> dict:
     return fp
 
 
-def _ensure_exchange_driver():
-    """
-    Work around a pre-existing engine quirk (present on master too): the API
-    singleton (jesse/services/api.py) builds its sandbox drivers only ONCE, from
-    `app.considering_exchanges` at first construction. When a backtest already ran
-    in this process against a different exchange name (e.g. the legacy 'Sandbox'
-    tests in this suite), orders for a new exchange name are silently dropped
-    ("driver not initiated yet") and the backtest reports zero trades. Registering
-    our exchange's driver up-front makes these tests independent of suite order.
-    """
-    from jesse.config import config as jesse_config
-
-    needs_restore = False
-    if not jesse_config['app']['considering_exchanges']:
-        # allow importing jesse.services.api in a fresh process (its module-level
-        # API() construction asserts a non-empty considering_exchanges)
-        jesse_config['app']['considering_exchanges'] = (EXCHANGE,)
-        needs_restore = True
-    try:
-        from jesse.exchanges import Sandbox
-        from jesse.services.api import api
-    finally:
-        if needs_restore:
-            jesse_config['app']['considering_exchanges'] = []
-
-    if EXCHANGE not in api.drivers:
-        api.drivers[EXCHANGE] = Sandbox(EXCHANGE)
-
-
 def run_scenario(scenario: dict) -> dict:
     """Build deterministic inputs, run research.backtest() and return the fingerprint."""
     import jesse.helpers as jh
     from jesse.research import backtest
-
-    _ensure_exchange_driver()
 
     config = {
         'starting_balance': 10_000,

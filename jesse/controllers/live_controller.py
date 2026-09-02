@@ -37,6 +37,16 @@ def live(request_json: LiveRequestJson) -> JSONResponse:
 
     trading_mode = live_session_modes.LIVETRADE if request_json.paper_mode is False else live_session_modes.PAPERTRADE
 
+    existing_session = live_session_repository.get_live_session_by_id(request_json.id)
+    if existing_session and existing_session.status != live_session_statuses.DRAFT:
+        return JSONResponse(
+            {
+                'error': f'Live session with ID {request_json.id} already exists.',
+                'message': 'Create a new session before starting again.',
+            },
+            status_code=409,
+        )
+
     live_session_repository.store_live_session(
         id=request_json.id,
         status=live_session_statuses.STARTING,
@@ -51,6 +61,7 @@ def live(request_json: LiveRequestJson) -> JSONResponse:
                 'notification_api_key_id': request_json.notification_api_key_id,
                 'routes': request_json.routes,
                 'data_routes': request_json.data_routes,
+                'config': request_json.config,
             }
         },
     )

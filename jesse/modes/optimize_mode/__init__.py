@@ -9,6 +9,7 @@ from .Optimize import Optimizer
 from jesse.services.failure import register_custom_exception_handler
 from jesse.routes import router
 from jesse.models.OptimizationSession import store_optimization_session, get_optimization_session_by_id, update_optimization_session_status, update_optimization_session_state
+from jesse.research.backtest import _reset_research_runtime_state
 
 
 def run(
@@ -33,6 +34,7 @@ def run(
     # candles for the training/testing windows, or a malformed config) so MCP/dashboard
     # callers stop polling a session that would otherwise stay stuck. Without this, a
     # candle shortage raised here surfaced to API clients as a silent hang.
+    optimizer_started = False
     try:
         if cpu_cores < 1:
             raise ValueError('cpu_cores must be an integer value greater than 0. Please check your settings page for optimization.')
@@ -112,6 +114,7 @@ def run(
             cpu_cores
         )
 
+        optimizer_started = True
         optimizer.run()
     except Exception as e:
         import traceback as _tb
@@ -134,14 +137,17 @@ def run(
             )
         else:
             message = f'{type(e).__name__}: {e}'
-        try:
-            if _get_session(session_id) is None:
-                _store_session(id=session_id, status='stopped')
-            _add_exception(session_id, message, _tb.format_exc())
-            _update_status(session_id, 'stopped')
-        except Exception:
-            pass
+        if not optimizer_started:
+            try:
+                if _get_session(session_id) is None:
+                    _store_session(id=session_id, status='stopped')
+                _add_exception(session_id, message, _tb.format_exc())
+                _update_status(session_id, 'stopped')
+            except Exception:
+                pass
         raise
+    finally:
+        _reset_research_runtime_state()
 
 
 def _get_training_and_testing_candles(

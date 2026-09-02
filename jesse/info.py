@@ -52,7 +52,7 @@ exchange_info = {
         "url": JESSE_WEBSITE_URL + "/kucoin",
         "fee": 0.001,  # spot taker fee 0.1%
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": KUCOIN_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -141,7 +141,7 @@ exchange_info = {
         "url": "https://jesse.trade/bybit",
         "fee": 0.001,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BYBIT_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -155,7 +155,7 @@ exchange_info = {
         "url": "https://jesse.trade/bybit",
         "fee": 0.001,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BYBIT_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -169,7 +169,7 @@ exchange_info = {
         "url": "https://bitfinex.com",
         "fee": 0.002,
         "type": "spot",
-        "supported_leverage_modes": ["cross"],
+        "supported_leverage_modes": [],
         "supported_timeframes": [
             timeframes.MINUTE_1,
             timeframes.MINUTE_5,
@@ -193,7 +193,7 @@ exchange_info = {
         "url": "https://binance.com",
         "fee": 0.001,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BINANCE_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -207,7 +207,7 @@ exchange_info = {
         "url": "https://binance.us",
         "fee": 0.001,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BINANCE_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -249,7 +249,7 @@ exchange_info = {
         "url": "https://www.coinbase.com/advanced-trade/spot/BTC-USD",
         "fee": 0.0003,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": COINBASE_TIMEFRAMES,
         "modes": {
             "backtesting": True,
@@ -301,7 +301,7 @@ exchange_info = {
         "url": "https://jesse.trade/gate",
         "fee": 0.0005,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": GATE_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -329,7 +329,7 @@ exchange_info = {
         "url": "https://ftx.com/markets/spot",
         "fee": 0.0007,
         "type": "spot",
-        "supported_leverage_modes": ["cross"],
+        "supported_leverage_modes": [],
         "supported_timeframes": FTX_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -343,7 +343,7 @@ exchange_info = {
         "url": "https://ftx.us",
         "fee": 0.002,
         "type": "spot",
-        "supported_leverage_modes": ["cross"],
+        "supported_leverage_modes": [],
         "supported_timeframes": FTX_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -385,7 +385,7 @@ exchange_info = {
         "url": JESSE_WEBSITE_URL + "/bitget",
         "fee": 0.0006,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": BITGET_TIMEFRAMES,
         "modes": {
             "backtesting": False,
@@ -489,7 +489,7 @@ exchange_info = {
         # We use 0.0026 as a representative value; the real fee depends on the account's 30d volume tier.
         "fee": 0.0026,
         "type": "spot",
-        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_leverage_modes": [],
         "supported_timeframes": KRAKEN_TIMEFRAMES,
         "modes": {
             # Kraken's public OHLC REST endpoint only serves the most recent 720 candles
@@ -528,7 +528,106 @@ exchange_info = {
         },
         "required_live_plan": "free",
     },
+    exchanges_enums.CUSTOM_DATA: {
+        "name": exchanges_enums.CUSTOM_DATA,
+        "url": "https://docs.jesse.trade",
+        "fee": 0.0004,
+        "type": "futures",
+        "supported_leverage_modes": ["cross", "isolated"],
+        "supported_timeframes": [timeframes.MINUTE_1],
+        "modes": {
+            "backtesting": True,
+            "live_trading": False,
+        },
+        "required_live_plan": "free",
+        # Files can represent any market; Binance-style perpetual execution defaults remain editable.
+        "asset_class": "equity",
+        "instrument_type": "perpetual",
+        "simulation_model": "perpetual_futures",
+        "annualization": 252,
+    },
+    exchanges_enums.MASSIVE_STOCKS: {
+        "name": exchanges_enums.MASSIVE_STOCKS,
+        "url": "https://massive.com",
+        # Massive is a historical data source, so execution fees remain a run setting.
+        "fee": 0.0,
+        "type": "spot",
+        "supported_leverage_modes": [],
+        "supported_timeframes": [timeframes.MINUTE_1],
+        "modes": {
+            # Historical-only sources reuse the backtesting selector but never appear in live execution.
+            "backtesting": True,
+            "live_trading": False,
+        },
+        "required_live_plan": "premium",
+        "asset_class": "equity",
+        "instrument_type": "stock",
+        "simulation_model": "spot",
+        "annualization": 252,
+    },
+    exchanges_enums.MASSIVE_CURRENCIES: {
+        "name": exchanges_enums.MASSIVE_CURRENCIES,
+        "url": "https://massive.com",
+        "fee": 0.0,
+        "type": "spot",
+        "supported_leverage_modes": [],
+        "supported_timeframes": [timeframes.MINUTE_1],
+        "modes": {
+            "backtesting": True,
+            "live_trading": False,
+        },
+        "required_live_plan": "premium",
+        "asset_class": "currency",
+        "instrument_type": "spot",
+        "simulation_model": "spot",
+        # The merged product defaults to the conventional FX basis; crypto research can override it.
+        "annualization": 252,
+    },
+    exchanges_enums.MASSIVE_INDICES: {
+        "name": exchanges_enums.MASSIVE_INDICES,
+        "url": "https://massive.com",
+        "fee": 0.0,
+        "type": "spot",
+        "supported_leverage_modes": [],
+        "supported_timeframes": [timeframes.MINUTE_1],
+        "modes": {
+            "backtesting": True,
+            "live_trading": False,
+        },
+        "required_live_plan": "premium",
+        "asset_class": "index",
+        "instrument_type": "index",
+        "simulation_model": "spot",
+        "annualization": 252,
+    },
+    exchanges_enums.MASSIVE_FUTURES: {
+        "name": exchanges_enums.MASSIVE_FUTURES,
+        "url": "https://massive.com",
+        # Contract multipliers, settlement, and rollover are not inferred from candle data.
+        "fee": 0.0,
+        "type": "spot",
+        "supported_leverage_modes": [],
+        "supported_timeframes": [timeframes.MINUTE_1],
+        "modes": {
+            "backtesting": True,
+            "live_trading": False,
+        },
+        "required_live_plan": "premium",
+        "asset_class": "futures",
+        "instrument_type": "futures_contract",
+        # Price research uses synthetic units until explicit contract-multiplier accounting exists.
+        "simulation_model": "spot",
+        "annualization": 252,
+    },
 }
+
+# Trading exchange entries are crypto unless a historical source declares its
+# own classification and simulation assumptions.
+for _exchange in exchange_info.values():
+    _exchange.setdefault('asset_class', 'crypto')
+    _exchange.setdefault('instrument_type', 'perpetual' if _exchange['type'] == 'futures' else 'spot')
+    _exchange.setdefault('simulation_model', 'perpetual_futures' if _exchange['type'] == 'futures' else 'spot')
+    _exchange.setdefault('annualization', 365)
 
 # list of supported exchanges for backtesting
 backtesting_exchanges = [k for k, v in exchange_info.items() if v['modes']['backtesting'] is True]

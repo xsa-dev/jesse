@@ -318,10 +318,13 @@ def _extract_candles_summary_metrics(results: dict) -> list:
     metrics = []
     results = json.loads(results)
 
-    if not results or 'confidence_analysis' not in results:
+    confidence_analysis = results.get('confidence_analysis') if isinstance(results, dict) else None
+    if not isinstance(confidence_analysis, dict):
         return metrics
 
-    ca_metrics = results['confidence_analysis']['metrics']
+    ca_metrics = confidence_analysis.get('metrics')
+    if not isinstance(ca_metrics, dict):
+        return metrics
 
     # Define metrics to display (in order)
     metric_keys = ['net_profit_percentage', 'max_drawdown', 'sharpe_ratio', 'win_rate', 'total', 'annual_return', 'calmar_ratio']
@@ -355,10 +358,13 @@ def _extract_trades_summary_metrics(results: dict) -> list:
     metrics = []
     results = json.loads(results)
 
-    if not results or 'confidence_analysis' not in results:
+    confidence_analysis = results.get('confidence_analysis') if isinstance(results, dict) else None
+    if not isinstance(confidence_analysis, dict):
         return metrics
 
-    ca_metrics = results['confidence_analysis']['metrics']
+    ca_metrics = confidence_analysis.get('metrics')
+    if not isinstance(ca_metrics, dict):
+        return metrics
 
     # Define metrics to display (in order)
     metric_keys = ['total_return', 'max_drawdown', 'sharpe_ratio', 'calmar_ratio']

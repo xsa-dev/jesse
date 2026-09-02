@@ -490,6 +490,13 @@ def is_paper_trading() -> bool:
     return config['app']['trading_mode'] == 'papertrade'
 
 
+def clear_config_caches() -> None:
+    """Clear values derived from mutable runtime configuration."""
+    CACHED_CONFIG.clear()
+    for cached_helper in (app_mode, is_live, is_livetrading, is_optimizing, is_paper_trading):
+        cached_helper.cache_clear()
+
+
 @lru_cache
 def _is_pytest_script() -> bool:
     # Check if the code is being executed from the pytest command-line tool.
