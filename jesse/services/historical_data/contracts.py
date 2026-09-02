@@ -372,6 +372,10 @@ class HistoricalCandleProvider(ABC):
         """List provider symbols when the provider advertises ticker-search support."""
         raise ProviderCapabilityError(f'Provider {self.provider_id!r} does not support symbol discovery')
 
+    def find_earliest_available_timestamp(self, request: HistoricalCandleRequest) -> int | None:
+        """Return the first available candle in a range, or its start when discovery is unsupported."""
+        return request.requested_range.start_timestamp
+
     @abstractmethod
     def _fetch_candles(self, request: HistoricalCandleRequest) -> HistoricalCandleBatch:
         """Implement provider-specific retrieval and return normalized candles."""

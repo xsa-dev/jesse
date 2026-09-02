@@ -40,43 +40,26 @@ def get_existing_candles() -> List[dict]:
     """
     Returns a list of all existing candles grouped by exchange and symbol
     """
-    results = []
-    
-    # Get unique exchange-symbol combinations
-    pairs = Candle.select(
-        Candle.exchange, 
-        Candle.symbol
-    ).distinct().tuples()
-
-    for exchange, symbol in pairs:
-        # Get first and last candle for this pair
-        first = Candle.select(
-            Candle.timestamp
-        ).where(
-            Candle.exchange == exchange,
-            Candle.symbol == symbol
-        ).order_by(
-            Candle.timestamp.asc()
-        ).first()
-
-        last = Candle.select(
-            Candle.timestamp
-        ).where(
-            Candle.exchange == exchange,
-            Candle.symbol == symbol
-        ).order_by(
-            Candle.timestamp.desc()
-        ).first()
-
-        if first and last:
-            results.append({
-                'exchange': exchange,
-                'symbol': symbol,
-                'start_date': arrow.get(first.timestamp / 1000).format('YYYY-MM-DD'),
-                'end_date': arrow.get(last.timestamp / 1000).format('YYYY-MM-DD')
-            })
-
-    return results
+    # One grouped scan avoids two additional database round trips for every stored dataset.
+    summaries = (
+        Candle.select(
+            Candle.exchange,
+            Candle.symbol,
+            peewee.fn.MIN(Candle.timestamp),
+            peewee.fn.MAX(Candle.timestamp),
+        )
+        .group_by(Candle.exchange, Candle.symbol)
+        .tuples()
+    )
+    return [
+        {
+            'exchange': exchange,
+            'symbol': symbol,
+            'start_date': arrow.get(first_timestamp / 1000).format('YYYY-MM-DD'),
+            'end_date': arrow.get(last_timestamp / 1000).format('YYYY-MM-DD'),
+        }
+        for exchange, symbol, first_timestamp, last_timestamp in summaries
+    ]
 
 
 def get_stored_symbols(exchange: str) -> list[str]:

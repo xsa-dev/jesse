@@ -157,6 +157,32 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
 
         raise ProviderPaginationError('Massive pagination exceeded the safety limit')
 
+    def find_earliest_available_timestamp(self, request: HistoricalCandleRequest) -> int | None:
+        """Probe one ascending aggregate so Massive's actual entitlement defines the import start."""
+        if request.adjustment_mode is not self.capabilities.default_adjustment_mode:
+            raise HistoricalDataRequestError(
+                f'{self.provider_id} requires {self.capabilities.default_adjustment_mode.value} candles'
+            )
+        api_key = self._credential_loader()
+        provider_symbol = self._provider_symbol(request.symbol, api_key)
+        params: dict[str, str | int] = {'sort': 'asc', 'limit': 1}
+        if self.supports_adjustment:
+            params['adjusted'] = (
+                'true' if request.adjustment_mode is AdjustmentMode.SPLIT_ADJUSTED else 'false'
+            )
+        payload = self._request_json(_aggregate_url(provider_symbol, request), api_key, params)
+        candles = _normalize_page(
+            payload,
+            request,
+            provider_symbol,
+            expected_adjusted=(
+                request.adjustment_mode is AdjustmentMode.SPLIT_ADJUSTED
+                if self.supports_adjustment
+                else None
+            ),
+        )
+        return candles[0].timestamp if candles else None
+
     def search_symbols(self, query: str, limit: int = MASSIVE_TICKER_SEARCH_LIMIT) -> tuple[str, ...]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MASSIVE_TICKER_SEARCH_LIMIT:
             raise HistoricalDataRequestError(
@@ -499,6 +525,26 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
             params = None
 
         raise ProviderPaginationError('Massive Futures aggregate pagination exceeded the safety limit')
+
+    def find_earliest_available_timestamp(self, request: HistoricalCandleRequest) -> int | None:
+        """Probe the first entitled aggregate for an explicit futures contract."""
+        if request.adjustment_mode is not AdjustmentMode.NONE:
+            raise HistoricalDataRequestError('Massive Futures requires unadjusted candles')
+        api_key = self._credential_loader()
+        provider_symbol = self._provider_symbol(request.symbol, api_key)
+        payload = self._request_json(
+            f'{MASSIVE_FUTURES_AGGREGATES_URL}/{quote(provider_symbol, safe="")}',
+            api_key,
+            {
+                'resolution': '1min',
+                'window_start.gte': request.requested_range.start_timestamp * 1_000_000,
+                'window_start.lt': request.requested_range.end_timestamp * 1_000_000,
+                'sort': 'window_start.asc',
+                'limit': 1,
+            },
+        )
+        candles = _normalize_futures_page(payload, request, provider_symbol)
+        return candles[0].timestamp if candles else None
 
     def search_symbols(self, query: str, limit: int = MASSIVE_TICKER_SEARCH_LIMIT) -> tuple[str, ...]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MASSIVE_TICKER_SEARCH_LIMIT:

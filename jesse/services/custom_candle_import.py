@@ -1,8 +1,11 @@
 import csv
 import math
 import re
+import sqlite3
+import tempfile
 from datetime import datetime
 from io import TextIOWrapper
+from pathlib import Path
 from typing import BinaryIO, Callable
 
 from jesse.enums import exchanges
@@ -14,12 +17,12 @@ from jesse.services.historical_data.errors import HistoricalDataError
 
 REQUIRED_COLUMNS = ('timestamp', 'open', 'close', 'high', 'low', 'volume')
 TIMESTAMP_FORMATS = {'auto', 'unix_ms', 'unix_s', 'iso8601'}
-ADJUSTMENT_MODES = {'adjusted', 'unadjusted'}
 SYMBOL_PATTERN = re.compile(r'^[A-Z0-9][A-Z0-9._]*-[A-Z0-9][A-Z0-9._]*$')
 # Match the repository insert batch, which remains below PostgreSQL's bind-parameter limit.
 IMPORT_BATCH_SIZE = 5_000
 # Continue scanning the full upload without returning an unbounded validation payload.
 MAX_REPORTED_ERRORS = 20
+CLEANING_POLICIES = {'reject', 'drop'}
 
 
 class CustomCandleImportError(ValueError):
@@ -169,17 +172,160 @@ def scan_custom_candle_csv(
         text_stream.detach()
 
 
+def clean_custom_candle_csv(
+    file_object: BinaryIO,
+    cleaned_file_object: BinaryIO,
+    timestamp_format: str,
+    column_mapping: dict[str, str],
+    invalid_row_policy: str,
+) -> dict:
+    """Normalize a CSV into canonical timestamp order without inventing or changing candles."""
+    if timestamp_format not in TIMESTAMP_FORMATS:
+        raise CustomCandleImportError(f'Unsupported timestamp format: {timestamp_format}')
+    if invalid_row_policy not in CLEANING_POLICIES:
+        raise CustomCandleImportError(f'Unsupported invalid-row policy: {invalid_row_policy}')
+    mapping = {
+        column: column_mapping.get(column, column).strip().lower()
+        for column in REQUIRED_COLUMNS
+    }
+    if any(not source_column for source_column in mapping.values()):
+        raise CustomCandleImportError('Every required candle column must be mapped.')
+    if len(set(mapping.values())) != len(mapping):
+        raise CustomCandleImportError('Each required candle field must map to a different CSV column.')
+
+    row_count = 0
+    invalid_row_count = 0
+    duplicate_count = 0
+    conflicting_duplicate_count = 0
+    ordering_failure_count = 0
+    errors = []
+    previous_timestamp = None
+    file_object.seek(0)
+    text_stream = TextIOWrapper(file_object, encoding='utf-8-sig', newline='')
+    try:
+        reader = csv.DictReader(text_stream)
+        headers = tuple((header or '').strip().lower() for header in (reader.fieldnames or ()))
+        if len(headers) != len(set(headers)):
+            raise CustomCandleImportError('CSV column names must be unique.')
+        missing_columns = [source_column for source_column in mapping.values() if source_column not in headers]
+        if missing_columns:
+            raise CustomCandleImportError(f'Missing required CSV columns: {", ".join(missing_columns)}')
+
+        # A disk-backed primary key keeps sorting and duplicate detection bounded for multi-year files.
+        with tempfile.TemporaryDirectory() as temp_directory:
+            database_path = Path(temp_directory) / 'custom-candle-cleaning.sqlite3'
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    'CREATE TABLE candles ('
+                    'timestamp INTEGER PRIMARY KEY, open REAL, close REAL, high REAL, low REAL, volume REAL'
+                    ')'
+                )
+                for line_number, raw_row in enumerate(reader, start=2):
+                    row_count += 1
+                    source_row = {
+                        (key or '').strip().lower(): value.strip() if isinstance(value, str) else ''
+                        for key, value in raw_row.items()
+                        if key is not None
+                    }
+                    row = {column: source_row.get(source_column, '') for column, source_column in mapping.items()}
+                    try:
+                        candle = _parse_candle(row, timestamp_format)
+                    except (ValueError, TypeError, KeyError, OverflowError, HistoricalDataError) as exc:
+                        invalid_row_count += 1
+                        if len(errors) < MAX_REPORTED_ERRORS:
+                            errors.append(f'Line {line_number}: {exc}')
+                        continue
+
+                    if previous_timestamp is not None and candle.timestamp < previous_timestamp:
+                        ordering_failure_count += 1
+                    previous_timestamp = candle.timestamp
+                    values = (
+                        candle.timestamp,
+                        candle.open,
+                        candle.close,
+                        candle.high,
+                        candle.low,
+                        candle.volume,
+                    )
+                    try:
+                        connection.execute('INSERT INTO candles VALUES (?, ?, ?, ?, ?, ?)', values)
+                    except sqlite3.IntegrityError:
+                        stored = connection.execute(
+                            'SELECT timestamp, open, close, high, low, volume FROM candles WHERE timestamp = ?',
+                            (candle.timestamp,),
+                        ).fetchone()
+                        if stored == values:
+                            duplicate_count += 1
+                        else:
+                            conflicting_duplicate_count += 1
+                            if len(errors) < MAX_REPORTED_ERRORS:
+                                errors.append(
+                                    f'Line {line_number}: timestamp {candle.timestamp} conflicts with an earlier row.'
+                                )
+                connection.commit()
+
+                cleaned_row_count = connection.execute('SELECT COUNT(*) FROM candles').fetchone()[0]
+                first_timestamp = None
+                last_timestamp = None
+                missing_minutes = 0
+                previous_cleaned_timestamp = None
+                cleaned_file_object.seek(0)
+                cleaned_file_object.truncate(0)
+                cleaned_text_stream = TextIOWrapper(cleaned_file_object, encoding='utf-8', newline='')
+                try:
+                    writer = csv.writer(cleaned_text_stream, lineterminator='\n')
+                    writer.writerow(REQUIRED_COLUMNS)
+                    for values in connection.execute(
+                        'SELECT timestamp, open, close, high, low, volume FROM candles ORDER BY timestamp'
+                    ):
+                        timestamp = values[0]
+                        first_timestamp = timestamp if first_timestamp is None else first_timestamp
+                        last_timestamp = timestamp
+                        if previous_cleaned_timestamp is not None:
+                            missing_minutes += (timestamp - previous_cleaned_timestamp) // 60_000 - 1
+                        previous_cleaned_timestamp = timestamp
+                        writer.writerow(values)
+                    cleaned_text_stream.flush()
+                finally:
+                    cleaned_text_stream.detach()
+            finally:
+                connection.close()
+    except UnicodeDecodeError as exc:
+        raise CustomCandleImportError('The CSV must be UTF-8 encoded.') from exc
+    except csv.Error as exc:
+        raise CustomCandleImportError(f'Malformed CSV: {exc}') from exc
+    finally:
+        text_stream.detach()
+
+    can_import_with_drop = cleaned_row_count > 0 and conflicting_duplicate_count == 0
+    can_import_with_reject = can_import_with_drop and invalid_row_count == 0
+    return {
+        'valid': can_import_with_reject if invalid_row_policy == 'reject' else can_import_with_drop,
+        'row_count': row_count,
+        'cleaned_row_count': cleaned_row_count,
+        'invalid_row_count': invalid_row_count,
+        'dropped_row_count': duplicate_count + (invalid_row_count if invalid_row_policy == 'drop' else 0),
+        'duplicate_count': duplicate_count,
+        'conflicting_duplicate_count': conflicting_duplicate_count,
+        'ordering_failure_count': ordering_failure_count,
+        'first_timestamp': first_timestamp,
+        'last_timestamp': last_timestamp,
+        'missing_minutes': missing_minutes,
+        'can_import_with_reject': can_import_with_reject,
+        'can_import_with_drop': can_import_with_drop,
+        'errors': errors,
+    }
+
+
 def import_custom_candle_csv(
     file_object: BinaryIO,
     symbol: str,
     timestamp_format: str,
-    adjustment_mode: str,
     column_mapping: dict[str, str],
 ) -> dict:
     """Validate the complete upload, then persist it atomically as observed custom candles."""
     normalized_symbol = normalize_custom_symbol(symbol)
-    if adjustment_mode not in ADJUSTMENT_MODES:
-        raise CustomCandleImportError(f'Unsupported adjustment mode: {adjustment_mode}')
     report = scan_custom_candle_csv(file_object, timestamp_format, column_mapping)
     if not report['valid']:
         raise CustomCandleImportError(report['errors'][0])
@@ -203,5 +349,4 @@ def import_custom_candle_csv(
         'symbol': normalized_symbol,
         'exchange': exchanges.CUSTOM_DATA,
         'timeframe': '1m',
-        'adjustment_mode': adjustment_mode,
     }

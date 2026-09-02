@@ -71,7 +71,6 @@ def export_candles(
 def preview_custom_candles(
     file: Annotated[UploadFile, File()],
     symbol: Annotated[str, Form()],
-    adjustment_mode: Annotated[str, Form()],
     timestamp_format: Annotated[str, Form()] = 'auto',
     timestamp_column: Annotated[str, Form()] = 'timestamp',
     open_column: Annotated[str, Form()] = 'open',
@@ -82,8 +81,6 @@ def preview_custom_candles(
 ) -> JSONResponse:
     """Validate an uploaded candle CSV without changing persisted data."""
     try:
-        if adjustment_mode not in {'adjusted', 'unadjusted'}:
-            raise CustomCandleImportError(f'Unsupported adjustment mode: {adjustment_mode}')
         column_mapping = {
             'timestamp': timestamp_column,
             'open': open_column,
@@ -98,7 +95,6 @@ def preview_custom_candles(
                 **report,
                 'symbol': normalize_custom_symbol(symbol),
                 'timeframe': '1m',
-                'adjustment_mode': adjustment_mode,
             }
         }, status_code=200)
     except CustomCandleImportError as exc:
@@ -109,7 +105,6 @@ def preview_custom_candles(
 def import_custom_candles(
     file: Annotated[UploadFile, File()],
     symbol: Annotated[str, Form()],
-    adjustment_mode: Annotated[str, Form()],
     timestamp_format: Annotated[str, Form()] = 'auto',
     timestamp_column: Annotated[str, Form()] = 'timestamp',
     open_column: Annotated[str, Form()] = 'open',
@@ -124,7 +119,6 @@ def import_custom_candles(
             file.file,
             symbol,
             timestamp_format,
-            adjustment_mode,
             {
                 'timestamp': timestamp_column,
                 'open': open_column,
@@ -252,6 +246,8 @@ def get_candle_import_status(request_json: CancelRequestJson) -> JSONResponse:
             response['error'] = outcome['error']
         if outcome.get('traceback') is not None:
             response['traceback'] = outcome['traceback']
+        if outcome.get('result') is not None:
+            response['result'] = outcome['result']
 
     # Attach live progress (percent complete, ETA, date reached so far) when the import
     # is still running so callers can see real movement instead of a blind "running".

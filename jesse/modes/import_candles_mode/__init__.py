@@ -45,6 +45,7 @@ def store_import_outcome(
     status: str,
     error: str = None,
     error_traceback: str = None,
+    result: dict | None = None,
 ) -> None:
     """Persist a terminal import outcome so polling clients receive the real result."""
     payload = {'status': status}
@@ -52,6 +53,8 @@ def store_import_outcome(
         payload['error'] = error
     if error_traceback is not None:
         payload['traceback'] = error_traceback
+    if result is not None:
+        payload['result'] = result
 
     try:
         sync_redis.set(
@@ -241,7 +244,7 @@ def run(
         raise
     else:
         if running_via_dashboard:
-            store_import_outcome(client_id, 'finished')
+            store_import_outcome(client_id, 'finished', result=result)
         return result
 
 
@@ -280,18 +283,40 @@ def _run(
         symbol,
         '1m',
     )
+    effective_start_timestamp = start_timestamp
+    if first_timestamp is None or start_timestamp < first_timestamp:
+        # Provider data access can begin years after a symbol's listing date; probe the actual
+        # entitled range once instead of issuing one empty page request per historical chunk.
+        availability_request = HistoricalCandleRequest(
+            symbol=symbol,
+            timeframe='1m',
+            requested_range=HistoricalCandleRange(start_timestamp, end_timestamp),
+            adjustment_mode=provider.capabilities.default_adjustment_mode,
+        )
+        available_timestamp = provider.find_earliest_available_timestamp(availability_request)
+        if available_timestamp is None:
+            if first_timestamp is None:
+                raise CandleNotFoundInExchange(
+                    f'No observed candles were returned for {symbol} on {exchange} in the requested range'
+                )
+            effective_start_timestamp = first_timestamp
+        else:
+            effective_start_timestamp = max(start_timestamp, available_timestamp)
+
     import_ranges = _missing_import_ranges(
-        start_timestamp,
+        effective_start_timestamp,
         end_timestamp,
         first_timestamp,
         latest_timestamp,
         interval,
     )
-    total_span = end_timestamp - start_timestamp
+    total_span = end_timestamp - effective_start_timestamp
     work_span = sum(range_end - range_start for range_start, range_end in import_ranges)
     completed_span = total_span - work_span
     completed_work = 0
     processed_candles = 0
+    observed_first_timestamp = first_timestamp
+    observed_latest_timestamp = latest_timestamp
     started_at = time.monotonic()
 
     if not import_ranges:
@@ -335,6 +360,19 @@ def _run(
             _raise_if_cancelled(client_id, running_via_dashboard)
             candle_repository.store_observed_candles(exchange, symbol, '1m', batch.candles)
             processed_candles += len(batch.candles)
+            if batch.candles:
+                batch_first_timestamp = batch.candles[0].timestamp
+                batch_latest_timestamp = batch.candles[-1].timestamp
+                observed_first_timestamp = (
+                    batch_first_timestamp
+                    if observed_first_timestamp is None
+                    else min(observed_first_timestamp, batch_first_timestamp)
+                )
+                observed_latest_timestamp = (
+                    batch_latest_timestamp
+                    if observed_latest_timestamp is None
+                    else max(observed_latest_timestamp, batch_latest_timestamp)
+                )
             _raise_if_cancelled(client_id, running_via_dashboard)
 
             covered_end = page_end
@@ -367,17 +405,43 @@ def _run(
             if completed_work < work_span and provider.capabilities.request_delay_seconds:
                 time.sleep(provider.capabilities.request_delay_seconds)
 
-    if first_timestamp is None and latest_timestamp is None and processed_candles == 0:
+    if (
+        observed_first_timestamp is None
+        or observed_latest_timestamp is None
+        or observed_latest_timestamp < effective_start_timestamp
+        or observed_first_timestamp >= end_timestamp
+    ):
         raise CandleNotFoundInExchange(
             f'No observed candles were returned for {symbol} on {exchange} in the requested range'
         )
-
-    yesterday = jh.timestamp_to_date(end_timestamp - interval)
+    actual_start_timestamp = max(start_timestamp, observed_first_timestamp)
+    actual_end_timestamp = min(end_timestamp - interval, observed_latest_timestamp)
+    requested_start_date = jh.timestamp_to_date(start_timestamp)
+    actual_start_date = jh.timestamp_to_date(actual_start_timestamp)
+    actual_end_date = jh.timestamp_to_date(actual_end_timestamp)
     success_text = (
         f'Successfully processed {processed_candles} observed candles since '
-        f'"{jh.timestamp_to_date(start_timestamp)}" through "{yesterday}". '
+        f'"{actual_start_date}" through "{actual_end_date}". '
         'Existing rows were retained.'
     )
+    if actual_start_timestamp > start_timestamp:
+        success_text = (
+            f'The requested start was "{requested_start_date}"; the earliest available candle was '
+            f'"{actual_start_date}". {success_text}'
+        )
+    import_result = {
+        'exchange': exchange,
+        'symbol': symbol,
+        'timeframe': '1m',
+        'requested_start_timestamp': start_timestamp,
+        'requested_start_date': requested_start_date,
+        'actual_start_timestamp': actual_start_timestamp,
+        'actual_start_date': actual_start_date,
+        'actual_end_timestamp': actual_end_timestamp,
+        'actual_end_date': actual_end_date,
+        'processed_candles': processed_candles,
+        'message': success_text,
+    }
 
     _raise_if_cancelled(client_id, running_via_dashboard)
 
@@ -386,6 +450,7 @@ def _run(
             'message': success_text,
             'type': 'success'
         })
+        return import_result
 
     # # TODO: shen should it close the database?
     # # if it is to skip, then it's being called from another process hence we should leave the database be
