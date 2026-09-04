@@ -68,6 +68,7 @@ Key resources include:
 - jesse://configuration - System configuration and exchange settings
 - jesse://significance_test - Rule Significance Testing workflow, tool reference, and result interpretation
 - jesse://monte_carlo - Monte Carlo simulation workflow, summary metrics interpretation, and tool reference
+- jesse://credentials - Exchange API keys and data provider (Massive) credentials via MCP
 
 **CRITICAL**: Always consult `jesse://backtest_management` first when encountering strategy creation or backtesting errors. This resource contains solutions to the most common problems encountered during development.
 
@@ -217,7 +218,18 @@ Import Resume Rule (MCP reconnect-safe):
 - If data is still incomplete, call `import_candles(exchange, symbol, start_date)` again — the server automatically skips candles that are already stored, so re-running from the same `start_datea` is safe and efficient.
 - Note: passing the same `import_id` does NOT resume from a checkpoint; it simply starts a new process. The deduplication is handled by the storage layer regardless of import_id.
 
+Symbol Discovery: when the user names an instrument instead of an exact Jesse symbol, or an
+import fails with a symbol-not-found error, use `search_symbols(exchange, query)` and import the
+returned `symbol` verbatim. Details and per-source behavior: `jesse://candle`.
+
 Reference: See `jesse://candle` resource for detailed import procedures, parameters, and examples.
+
+=== CREDENTIAL MANAGEMENT ===
+
+Exchange API keys (Jesse Live) and data provider keys (Massive) are managed with the
+`*_exchange_api_key*` and `*_data_provider_credentials` tools. Only store a secret the user
+pasted in this conversation, never echo a key back, and confirm before deleting one.
+Tool reference and workflows: `jesse://credentials`.
 
 === CONFIGURATION MANAGEMENT ===
 
@@ -318,35 +330,23 @@ Reference: See `jesse://backtest_management` resource for detailed tool document
 
 === RULE SIGNIFICANCE TESTING (ENTRY SIGNAL VALIDATION) ===
 
-Rule Significance Testing (RST) statistically proves whether an entry signal has
-a genuine edge or is indistinguishable from random entries on the same candles.
-It returns a p-value. Interpretation: `< 0.05` = significant edge (proceed),
-`0.05–0.10` = borderline (flag as inconclusive), `> 0.10` = HARD STOP
-(indistinguishable from random — do not silently proceed to a full backtest).
+Rule Significance Testing (RST) checks whether a strategy's entry conditions
+predict the direction of the NEXT bar better than chance. It is a narrow
+entry-timing diagnostic, not a verdict on a full strategy: exits, stops,
+targets, sizing, fees, and multi-bar holding behavior are outside the test.
 
-**MANDATORY pre-flight when the ENTRY rule is new or changed:**
+**Only run RST when the user asks for it.** Trigger phrases include "validate
+this entry signal", "does this rule have an edge", "run RST", "significance
+test". If the user asks you to build, backtest, optimize, or improve a
+strategy without mentioning RST, do NOT run it on your own, do NOT treat it as
+a required first step, and do NOT gate strategy work or backtests on a p-value.
+You may mention once that RST exists as an optional diagnostic if entries look
+weak; never run it unasked.
 
-When a user proposes a NEW strategy idea / hypothesis, or asks you to change a
-strategy's ENTRY rule (e.g. "buy when RSI < 30 and MACD crosses up"), you must
-validate that entry signal BEFORE building out the full strategy, position
-sizing, exits, etc.
-
-Scope — this rule only fires when the entry logic itself is new or changed:
-- ✅ Fire RST: new strategy idea; changed `should_long` / `should_short` /
-  entry indicators / entry filters; swapping one entry rule for another.
-- ❌ Skip RST: changes that don't touch entry logic — exit rules, stop-loss /
-  take-profit math, position sizing, risk per trade, trailing logic, route /
-  timeframe / symbol swaps on the SAME entry, parameter tuning of exit-only
-  values, refactoring without semantic change.
-
-Override — if the user explicitly tells you to skip the significance test
-(e.g. "don't run RST", "just build it", "skip the validation step"), do NOT
-run it. Their instruction takes precedence; note in your reply that you
-skipped it at their request so the decision is auditable.
-
-Workflow:
-1. Write a MINIMAL strategy that implements ONLY the entry signal (no exits
-   tuned, no risk management). Use `create_strategy()` / `write_strategy()`.
+Workflow (when asked):
+1. If no strategy exists yet, write a MINIMAL strategy implementing ONLY the
+   entry signal with `create_strategy()` / `write_strategy()`. For an
+   existing strategy, test it as is.
 2. Create a significance test draft: `create_significance_test_draft(...)`
    - Use a meaningful date window (1–2 years).
    - Use `n_simulations >= 2000` for stable p-values.
@@ -355,20 +355,16 @@ Workflow:
 4. Poll `get_significance_test_session(session_id)` every few seconds until
    `status` is `"finished"`, `"stopped"`, or `"terminated"`.
 5. Inspect `results.p_value`:
-   - `p_value < 0.05`  → next-bar entry edge supported. Proceed to broader validation.
-   - `0.05 <= p_value <= 0.10` → borderline. Surface the number to the user
-     explicitly, flag it as inconclusive, and ask whether to proceed, refine
-     the signal, change timeframe or widen the date window. Do NOT
-     pretend it's a confirmed edge.
+   - `p_value < 0.05`  → next-bar entry edge supported.
+   - `0.05 <= p_value <= 0.10` → borderline. Surface the number, flag it as
+     inconclusive, and let the user decide whether to refine the signal,
+     change timeframe, or widen the date window.
    - `p_value > 0.10` → no reliable next-bar entry edge. Report that narrow
-     conclusion without calling the full strategy worthless: exits, stops,
-     targets, sizing, and multi-bar holding behavior are outside this test.
+     conclusion without calling the full strategy worthless; a profitable
+     multi-bar strategy can legitimately fail this test.
 6. Always report `observed_mean`, `annualized_return`, `p_value`,
-   `n_simulations`, and `n_observations` to the user.
-
-**Standalone use:** When the user explicitly asks to "validate this entry
-signal", "test if this rule has an edge", or anything similar, run exactly the
-same workflow without first building a full strategy.
+   `n_simulations`, and `n_observations` to the user, then continue with
+   whatever the user asked for next. A failed RST is information, not a stop.
 
 Constraints (enforced server-side):
 - Exactly ONE trading route per significance test (no multi-symbol/multi-tf).

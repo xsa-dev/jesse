@@ -2,6 +2,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from math import isfinite
@@ -22,6 +23,7 @@ from .contracts import (
     HistoricalCandleProvider,
     HistoricalCandleRequest,
     ProviderCapabilities,
+    SymbolCatalogEntry,
 )
 from .errors import (
     HistoricalCandleValidationError,
@@ -63,6 +65,47 @@ MASSIVE_RATE_LIMIT_FALLBACK_SECONDS = 60.0
 MASSIVE_RATE_LIMIT_STATE_TTL_SECONDS = 3_600
 # Fifty responsive selector results avoid downloading Massive's full equity catalog on every search.
 MASSIVE_TICKER_SEARCH_LIMIT = 50
+
+# Massive's equity `type` codes, spelled out so the Dashboard can show them without a legend.
+MASSIVE_STOCK_TYPE_LABELS: Mapping[str, str] = {
+    'CS': 'Common Stock',
+    'PFD': 'Preferred Stock',
+    'WARRANT': 'Warrant',
+    'RIGHT': 'Right',
+    'BOND': 'Bond',
+    'ETF': 'ETF',
+    'ETN': 'ETN',
+    'ETV': 'ETV',
+    'ETS': 'Single-Security ETF',
+    'SP': 'Structured Product',
+    'ADRC': 'ADR',
+    'ADRP': 'ADR Preferred',
+    'ADRR': 'ADR Right',
+    'ADRW': 'ADR Warrant',
+    'FUND': 'Fund',
+    'BASKET': 'Basket',
+    'UNIT': 'Unit',
+    'LT': 'Liquidating Trust',
+    'OS': 'Ordinary Shares',
+    'GDR': 'GDR',
+    'NYRS': 'NY Registry Shares',
+    'AGEN': 'Agency Bond',
+    'EQLK': 'Equity-Linked Bond',
+    'OTHER': 'Other',
+}
+# ISO 10383 market identifier codes Massive reports for the venues Jesse users meet most often.
+MASSIVE_VENUE_LABELS: Mapping[str, str] = {
+    'XNAS': 'NASDAQ',
+    'XNYS': 'NYSE',
+    'ARCX': 'NYSE Arca',
+    'XASE': 'NYSE American',
+    'BATS': 'Cboe BZX',
+    'XCBO': 'Cboe',
+    'XNYM': 'NYMEX',
+    'XCME': 'CME',
+    'XCBT': 'CBOT',
+    'XCEC': 'COMEX',
+}
 
 # Provider instances share process-local pacing so concurrent calls to one Massive product respect
 # a detected free-tier limit without slowing unrelated paid products.
@@ -199,12 +242,14 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
         if len(self.markets) == 1:
             params['market'] = self.markets[0]
         payload = self._request_json(MASSIVE_TICKERS_URL, api_key, params)
-        return _normalize_ticker_search(payload, self.markets, self._catalog_symbol)
+        return tuple(entry.symbol for entry in _normalize_ticker_search(payload, self.markets, self._catalog_entry))
 
     def list_symbols(self) -> tuple[str, ...]:
+        return tuple(entry.symbol for entry in self.list_symbol_entries())
+
+    def list_symbol_entries(self) -> tuple[SymbolCatalogEntry, ...]:
         api_key = self._credential_loader()
-        symbols = []
-        seen_symbols = set()
+        entries: dict[str, SymbolCatalogEntry] = {}
         symbol_markets: dict[str, str] = {}
         ambiguous_symbols = set()
         for market in self.markets:
@@ -223,17 +268,16 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
                     raise ProviderPaginationError('Massive returned a repeated ticker pagination URL')
                 visited_urls.add(url)
                 payload = self._request_json(url, api_key, params)
-                for symbol in _normalize_ticker_search(payload, self.markets, self._catalog_symbol):
-                    previous_market = symbol_markets.get(symbol)
+                for entry in _normalize_ticker_search(payload, self.markets, self._catalog_entry):
+                    previous_market = symbol_markets.get(entry.symbol)
                     if previous_market is not None and previous_market != market:
                         # Jesse's BASE-QUOTE form cannot distinguish a fiat pair from a crypto token
                         # with the same code, so omit only that collision instead of losing the catalog.
-                        ambiguous_symbols.add(symbol)
+                        ambiguous_symbols.add(entry.symbol)
                         continue
-                    if symbol not in seen_symbols:
-                        symbols.append(symbol)
-                        seen_symbols.add(symbol)
-                        symbol_markets[symbol] = market
+                    if entry.symbol not in entries:
+                        entries[entry.symbol] = entry
+                        symbol_markets[entry.symbol] = market
                 next_url = payload.get('next_url')
                 if next_url is None:
                     break
@@ -241,9 +285,9 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
                 params = None
             else:
                 raise ProviderPaginationError('Massive ticker pagination exceeded the safety limit')
-        if not symbols:
+        if not entries:
             raise ProviderSchemaError(f'Massive returned an empty active-{",".join(self.markets)} catalog')
-        return tuple(sorted(symbol for symbol in symbols if symbol not in ambiguous_symbols))
+        return tuple(entries[symbol] for symbol in sorted(entries) if symbol not in ambiguous_symbols)
 
     def _request_json(
         self,
@@ -375,7 +419,7 @@ class MassiveAggregatesProvider(HistoricalCandleProvider):
     def _provider_symbol(self, symbol: str, api_key: str) -> str:
         raise NotImplementedError
 
-    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+    def _catalog_entry(self, result: Mapping[str, Any]) -> SymbolCatalogEntry | None:
         raise NotImplementedError
 
 
@@ -395,11 +439,17 @@ class MassiveStocksProvider(MassiveAggregatesProvider):
     def _provider_symbol(self, symbol: str, api_key: str) -> str:
         return _strip_usd_quote(symbol)
 
-    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+    def _catalog_entry(self, result: Mapping[str, Any]) -> SymbolCatalogEntry | None:
         ticker = _catalog_ticker(result)
         if ticker is None or '-' in ticker:
             return None
-        return f'{ticker}-USD'
+        type_code = _optional_text(result, 'type')
+        return SymbolCatalogEntry(
+            f'{ticker}-USD',
+            name=_optional_text(result, 'name'),
+            kind=MASSIVE_STOCK_TYPE_LABELS.get(type_code.upper(), type_code) if type_code else None,
+            venue=_venue_label(_optional_text(result, 'primary_exchange')),
+        )
 
 
 class MassiveCurrenciesProvider(MassiveAggregatesProvider):
@@ -447,9 +497,16 @@ class MassiveCurrenciesProvider(MassiveAggregatesProvider):
         self._resolved_symbols[joined_symbol] = provider_symbol
         return provider_symbol
 
-    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+    def _catalog_entry(self, result: Mapping[str, Any]) -> SymbolCatalogEntry | None:
         market = result.get('market')
-        return _catalog_pair(result, 'C:' if market == 'fx' else 'X:')
+        symbol = _catalog_pair(result, 'C:' if market == 'fx' else 'X:')
+        if symbol is None:
+            return None
+        return SymbolCatalogEntry(
+            symbol,
+            name=_optional_text(result, 'name'),
+            kind='Forex' if market == 'fx' else 'Crypto',
+        )
 
 
 class MassiveIndicesProvider(MassiveAggregatesProvider):
@@ -465,12 +522,14 @@ class MassiveIndicesProvider(MassiveAggregatesProvider):
     def _provider_symbol(self, symbol: str, api_key: str) -> str:
         return f'I:{_strip_usd_quote(symbol)}'
 
-    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+    def _catalog_entry(self, result: Mapping[str, Any]) -> SymbolCatalogEntry | None:
         ticker = _catalog_ticker(result)
         if ticker is None or not ticker.startswith('I:'):
             return None
         ticker = ticker[2:]
-        return f'{ticker}-USD' if ticker and '-' not in ticker else None
+        if not ticker or '-' in ticker:
+            return None
+        return SymbolCatalogEntry(f'{ticker}-USD', name=_optional_text(result, 'name'), kind='Index')
 
 
 class MassiveFuturesProvider(MassiveAggregatesProvider):
@@ -554,11 +613,18 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
                 f'Massive Futures search limit must be between 1 and {MASSIVE_TICKER_SEARCH_LIMIT}'
             )
         normalized_query = query.strip().upper()
-        return tuple(symbol for symbol in self.list_symbols() if normalized_query in symbol)[:limit]
+        return tuple(
+            entry.symbol
+            for entry in self.list_symbol_entries()
+            if normalized_query in entry.symbol or (entry.name is not None and normalized_query in entry.name.upper())
+        )[:limit]
 
     def list_symbols(self) -> tuple[str, ...]:
+        return tuple(entry.symbol for entry in self.list_symbol_entries())
+
+    def list_symbol_entries(self) -> tuple[SymbolCatalogEntry, ...]:
         api_key = self._credential_loader()
-        product_currencies = self._load_product_currencies(api_key)
+        products = self._load_products(api_key)
         url = MASSIVE_FUTURES_CONTRACTS_URL
         params: dict[str, str | int] | None = {
             # A point-in-time snapshot avoids receiving one duplicate per contract per reference date.
@@ -568,28 +634,25 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
             'sort': 'ticker.asc',
             'limit': 1_000,
         }
-        symbols = []
-        seen_symbols = set()
+        entries: dict[str, SymbolCatalogEntry] = {}
         visited_urls = set()
         for _ in range(MASSIVE_MAX_PAGES):
             if url in visited_urls:
                 raise ProviderPaginationError('Massive Futures returned a repeated contract pagination URL')
             visited_urls.add(url)
             payload = self._request_json(url, api_key, params)
-            for symbol in _normalize_futures_contracts(payload, product_currencies):
-                if symbol not in seen_symbols:
-                    symbols.append(symbol)
-                    seen_symbols.add(symbol)
+            for entry in _normalize_futures_contracts(payload, products):
+                entries.setdefault(entry.symbol, entry)
             next_url = payload.get('next_url')
             if next_url is None:
-                if not symbols:
+                if not entries:
                     raise ProviderSchemaError('Massive Futures returned an empty active-contract catalog')
-                return tuple(symbols)
+                return tuple(entries.values())
             url = _validated_next_url(next_url)
             params = None
         raise ProviderPaginationError('Massive Futures contract pagination exceeded the safety limit')
 
-    def _load_product_currencies(self, api_key: str) -> dict[str, str]:
+    def _load_products(self, api_key: str) -> dict[str, '_FuturesProduct']:
         url = MASSIVE_FUTURES_PRODUCTS_URL
         params: dict[str, str | int] | None = {
             'date': datetime.now(timezone.utc).date().isoformat(),
@@ -599,25 +662,25 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
             # The endpoint permits 50,000 products, normally making this a single request.
             'limit': MASSIVE_PAGE_LIMIT,
         }
-        currencies: dict[str, str] = {}
+        products: dict[str, _FuturesProduct] = {}
         visited_urls = set()
         for _ in range(MASSIVE_MAX_PAGES):
             if url in visited_urls:
                 raise ProviderPaginationError('Massive Futures returned a repeated product pagination URL')
             visited_urls.add(url)
             payload = self._request_json(url, api_key, params)
-            for product_code, currency in _normalize_futures_products(payload):
-                previous = currencies.get(product_code)
-                if previous is not None and previous != currency:
+            for product in _normalize_futures_products(payload):
+                previous = products.get(product.code)
+                if previous is not None and previous.currency != product.currency:
                     raise ProviderSchemaError(
-                        f'Massive Futures returned conflicting currencies for product {product_code!r}'
+                        f'Massive Futures returned conflicting currencies for product {product.code!r}'
                     )
-                currencies[product_code] = currency
+                products.setdefault(product.code, product)
             next_url = payload.get('next_url')
             if next_url is None:
-                if not currencies:
+                if not products:
                     raise ProviderSchemaError('Massive Futures returned an empty product catalog')
-                return currencies
+                return products
             url = _validated_next_url(next_url)
             params = None
         raise ProviderPaginationError('Massive Futures product pagination exceeded the safety limit')
@@ -650,7 +713,7 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
             {'product_code': product_code, 'limit': 2},
         )
         products = _normalize_futures_products(product_payload)
-        matching_currencies = {currency for code, currency in products if code == product_code.upper()}
+        matching_currencies = {product.currency for product in products if product.code == product_code.upper()}
         if matching_currencies != {quote_asset}:
             raise ProviderSymbolNotFoundError(
                 f'Massive Futures contract {provider_symbol!r} does not use currency {quote_asset!r}'
@@ -658,8 +721,33 @@ class MassiveFuturesProvider(MassiveAggregatesProvider):
         self._resolved_symbols[normalized_symbol] = provider_symbol
         return provider_symbol
 
-    def _catalog_symbol(self, result: Mapping[str, Any]) -> str | None:
+    def _catalog_entry(self, result: Mapping[str, Any]) -> SymbolCatalogEntry | None:
         raise NotImplementedError
+
+
+@dataclass(frozen=True, slots=True)
+class _FuturesProduct:
+    """Product metadata shared by every contract of one Massive futures product code."""
+
+    code: str
+    currency: str
+    name: str | None = None
+    venue: str | None = None
+
+
+def _optional_text(result: Mapping[str, Any], key: str) -> str | None:
+    """Return a stripped string field, treating blanks and non-strings as absent metadata."""
+    value = result.get(key)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _venue_label(market_identifier: str | None) -> str | None:
+    if market_identifier is None:
+        return None
+    return MASSIVE_VENUE_LABELS.get(market_identifier.upper(), market_identifier)
 
 
 def _strip_usd_quote(symbol: str) -> str:
@@ -762,18 +850,14 @@ def _provider_error_message(payload: Mapping[str, Any]) -> str:
 def _normalize_ticker_search(
     payload: Mapping[str, Any],
     expected_markets: tuple[str, ...],
-    symbol_formatter: Callable[[Mapping[str, Any]], str | None],
-) -> tuple[str, ...]:
-    symbols = []
-    seen = set()
+    entry_formatter: Callable[[Mapping[str, Any]], SymbolCatalogEntry | None],
+) -> tuple[SymbolCatalogEntry, ...]:
+    entries: dict[str, SymbolCatalogEntry] = {}
     for result in _ticker_results(payload, expected_markets):
-        symbol = symbol_formatter(result)
-        if symbol is None:
-            continue
-        if symbol not in seen:
-            symbols.append(symbol)
-            seen.add(symbol)
-    return tuple(symbols)
+        entry = entry_formatter(result)
+        if entry is not None:
+            entries.setdefault(entry.symbol, entry)
+    return tuple(entries.values())
 
 
 def _ticker_results(payload: Mapping[str, Any], expected_markets: tuple[str, ...]) -> tuple[Mapping[str, Any], ...]:
@@ -871,7 +955,7 @@ def _normalize_page(
     return candles
 
 
-def _normalize_futures_products(payload: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+def _normalize_futures_products(payload: Mapping[str, Any]) -> tuple[_FuturesProduct, ...]:
     results = _successful_results(payload, 'Futures product')
     products = []
     for result in results:
@@ -885,16 +969,21 @@ def _normalize_futures_products(payload: Mapping[str, Any]) -> tuple[tuple[str, 
         currency = currency.strip().upper()
         if '-' in product_code or '-' in currency:
             raise ProviderSchemaError('Massive Futures product codes and currencies cannot contain dashes')
-        products.append((product_code, currency))
+        products.append(_FuturesProduct(
+            product_code,
+            currency,
+            _optional_text(result, 'name'),
+            _venue_label(_optional_text(result, 'trading_venue')),
+        ))
     return tuple(products)
 
 
 def _normalize_futures_contracts(
     payload: Mapping[str, Any],
-    product_currencies: Mapping[str, str],
-) -> tuple[str, ...]:
+    products: Mapping[str, _FuturesProduct],
+) -> tuple[SymbolCatalogEntry, ...]:
     results = _successful_results(payload, 'Futures contract')
-    symbols = []
+    entries = []
     for result in results:
         ticker = result.get('ticker')
         product_code = result.get('product_code')
@@ -906,16 +995,23 @@ def _normalize_futures_contracts(
             continue
         ticker = ticker.strip().upper()
         product_code = product_code.strip().upper()
-        currency = product_currencies.get(product_code)
-        if currency is None:
+        product = products.get(product_code)
+        if product is None:
             raise ProviderSchemaError(
                 f'Massive Futures contract {ticker!r} references unknown product {product_code!r}'
             )
         if '-' in ticker:
             # Massive occasionally labels calendar spreads as `single`; Jesse imports outright contracts only.
             continue
-        symbols.append(f'{ticker}-{currency}')
-    return tuple(symbols)
+        entries.append(SymbolCatalogEntry(
+            f'{ticker}-{product.currency}',
+            # The contract's own name only repeats its ticker; the product name says what is traded.
+            name=product.name,
+            kind='Future',
+            venue=_venue_label(_optional_text(result, 'trading_venue')) or product.venue,
+            expiry=_optional_text(result, 'last_trade_date'),
+        ))
+    return tuple(entries)
 
 
 def _normalize_futures_page(

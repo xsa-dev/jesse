@@ -12,6 +12,7 @@ from .contracts import (
     HistoricalDataSourceType,
     InstrumentType,
     ProviderCapabilities,
+    SymbolCatalogEntry,
 )
 from .registry import HistoricalCandleProviderRegistry
 from .massive_stocks import (
@@ -40,4 +41,5 @@ __all__ = [
     'MassiveIndicesProvider',
     'MassiveStocksProvider',
     'ProviderCapabilities',
+    'SymbolCatalogEntry',
 ]

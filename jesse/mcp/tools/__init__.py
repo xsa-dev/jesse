@@ -40,6 +40,7 @@ from jesse.mcp.tools.indicator import register_indicator_tools
 from jesse.mcp.tools.significance_test import register_significance_test_tools
 from jesse.mcp.tools.monte_carlo import register_monte_carlo_tools
 from jesse.mcp.tools.optimization import register_optimization_tools
+from jesse.mcp.tools.credentials import register_credentials_tools
 
 def register_tools(mcp):
     """
@@ -77,3 +78,6 @@ def register_tools(mcp):
 
     # Optimization tools (hyperparameter tuning with train/test split)
     register_optimization_tools(mcp)
+
+    # Credential tools (exchange API keys for Jesse Live, data provider keys for imports)
+    register_credentials_tools(mcp)

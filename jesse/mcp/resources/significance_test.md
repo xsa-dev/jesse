@@ -5,17 +5,18 @@ the direction of the next bar after market drift is removed. It records
 `should_long()` / `should_short()` without placing orders, then applies a
 stationary bootstrap to the zero-centred next-bar rule-return series.
 
-**Use this BEFORE writing a full strategy** when you only have a hypothesis,
-and any time the user asks you to "validate an entry signal".
+**Run it only when the user asks for it.** It is an optional diagnostic, not a
+required step before writing, backtesting, or improving a strategy.
 
 ## When to use
 
-- A user proposes a new strategy idea ("buy when RSI < 30 and MACD crosses up").
-  → Wrap that signal in a minimal strategy and use RST as one entry-timing diagnostic.
-- A user asks "is this entry signal any good?" / "validate this signal".
-  → RST it on a meaningful date window and report the p-value.
-- You finished a full backtest with mediocre results and want to know whether
-  the entries themselves are weak (vs. exits being weak).
+- The user asks "is this entry signal any good?" / "validate this signal" /
+  "run a significance test".
+  → Wrap the signal in a minimal entry-only strategy if none exists, RST it on a
+  meaningful date window, and report the p-value.
+- The user has a finished strategy with mediocre results and asks whether the
+  entries themselves are weak (vs. exits being weak).
+- Do not run it unasked, and do not stop strategy work because of its result.
 
 ## Interpreting results
 

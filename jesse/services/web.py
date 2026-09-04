@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 fastapi_app = FastAPI()
@@ -79,6 +79,12 @@ class ImportCandlesRequestJson(BaseModel):
 
 class ExchangeSupportedSymbolsRequestJson(BaseModel):
     exchange: str
+
+
+class SearchExchangeSymbolsRequestJson(BaseModel):
+    exchange: str
+    query: str
+    limit: int = Field(default=50, ge=1, le=200)
 
 
 class CancelRequestJson(BaseModel):

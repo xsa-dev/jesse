@@ -1,3 +1,4 @@
+import json
 from dataclasses import FrozenInstanceError, asdict
 
 import pytest
@@ -18,6 +19,7 @@ from jesse.services.historical_data import (
     HistoricalDataSourceType,
     InstrumentType,
     ProviderCapabilities,
+    SymbolCatalogEntry,
 )
 from jesse.services.historical_data.errors import (
     HistoricalCandleValidationError,
@@ -205,3 +207,206 @@ def test_annualization_supports_only_the_two_product_assumptions():
         resolve_annualization({'annualization': 360})
     with pytest.raises(InvalidConfig, match='252 or 365'):
         resolve_annualization({'annualization': 252.9})
+
+
+class _FakeMassiveResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.headers = {}
+
+    def json(self):
+        return self._payload
+
+    def close(self):
+        pass
+
+
+class _FakeMassiveSession:
+    """Serve fabricated Massive reference payloads keyed by URL path prefix; no real data or keys."""
+
+    def __init__(self, responses):
+        self._responses = responses
+        self.requests = []
+
+    def get(self, url, headers=None, params=None, timeout=None, allow_redirects=None):
+        self.requests.append((url, params))
+        for prefix, payload in self._responses:
+            if url.startswith(prefix):
+                return _FakeMassiveResponse(payload)
+        raise AssertionError(f'Unexpected Massive request {url!r}')
+
+
+def test_symbol_catalog_entries_default_to_bare_symbols_and_validate_details():
+    class SymbolsOnlyProvider(BarsOnlyProvider):
+        def list_symbols(self):
+            return ('BTC-USDT', 'ETH-USDT')
+
+    entries = SymbolsOnlyProvider().list_symbol_entries()
+
+    assert entries == (SymbolCatalogEntry('BTC-USDT'), SymbolCatalogEntry('ETH-USDT'))
+    assert entries[0].details() == {}
+    assert SymbolCatalogEntry('SPY-USD', name='SPDR S&P 500', kind='ETF').details() == {
+        'name': 'SPDR S&P 500',
+        'kind': 'ETF',
+    }
+    with pytest.raises(HistoricalCandleValidationError):
+        SymbolCatalogEntry('')
+    with pytest.raises(HistoricalCandleValidationError):
+        SymbolCatalogEntry('SPY-USD', name='   ')
+
+
+def test_massive_stock_catalog_carries_company_name_type_and_listing_venue():
+    from jesse.services.historical_data.massive_stocks import MASSIVE_TICKERS_URL, MassiveStocksProvider
+
+    session = _FakeMassiveSession([(MASSIVE_TICKERS_URL, {
+        'status': 'OK',
+        'results': [
+            {'ticker': 'GOOG', 'name': 'Alphabet Inc. Class C', 'market': 'stocks', 'type': 'CS', 'primary_exchange': 'XNAS'},
+            {'ticker': 'GGLL', 'name': 'Direxion Daily GOOGL Bull 2X ETF', 'market': 'stocks', 'type': 'ETF', 'primary_exchange': 'XNAS'},
+            {'ticker': 'ZZZ', 'market': 'stocks', 'type': 'XYZ', 'primary_exchange': 'QQQQ'},
+            {'ticker': 'ODD-W', 'name': 'Excluded warrant', 'market': 'stocks'},
+            {'ticker': 'C:EURUSD', 'name': 'Wrong market', 'market': 'fx'},
+        ],
+    })])
+    provider = MassiveStocksProvider(credential_loader=lambda: 'fabricated-key', session=session)
+
+    entries = provider.list_symbol_entries()
+
+    assert entries == (
+        SymbolCatalogEntry('GGLL-USD', name='Direxion Daily GOOGL Bull 2X ETF', kind='ETF', venue='NASDAQ'),
+        SymbolCatalogEntry('GOOG-USD', name='Alphabet Inc. Class C', kind='Common Stock', venue='NASDAQ'),
+        # Unknown codes fall through unchanged rather than hiding the instrument.
+        SymbolCatalogEntry('ZZZ-USD', kind='XYZ', venue='QQQQ'),
+    )
+    assert provider.list_symbols() == ('GGLL-USD', 'GOOG-USD', 'ZZZ-USD')
+    assert all(request[1] is None or request[1].get('market') == 'stocks' for request in session.requests)
+
+
+def test_massive_futures_catalog_describes_contracts_through_their_product():
+    from jesse.services.historical_data.massive_stocks import (
+        MASSIVE_FUTURES_CONTRACTS_URL,
+        MASSIVE_FUTURES_PRODUCTS_URL,
+        MassiveFuturesProvider,
+    )
+
+    session = _FakeMassiveSession([
+        (MASSIVE_FUTURES_PRODUCTS_URL, {'status': 'OK', 'results': [
+            {'product_code': 'CL', 'trade_currency_code': 'USD', 'name': 'Light Sweet Crude Oil Futures', 'trading_venue': 'XNYM'},
+        ]}),
+        (MASSIVE_FUTURES_CONTRACTS_URL, {'status': 'OK', 'results': [
+            {'ticker': 'CLF30', 'product_code': 'CL', 'type': 'single', 'name': 'CLF30 Future', 'last_trade_date': '2029-12-19', 'trading_venue': 'XNYM'},
+            {'ticker': 'CLF30-CLG30', 'product_code': 'CL', 'type': 'single'},
+        ]}),
+    ])
+    provider = MassiveFuturesProvider(credential_loader=lambda: 'fabricated-key', session=session)
+
+    entries = provider.list_symbol_entries()
+
+    assert entries == (
+        SymbolCatalogEntry('CLF30-USD', name='Light Sweet Crude Oil Futures', kind='Future', venue='NYMEX', expiry='2029-12-19'),
+    )
+    assert provider.search_symbols('crude') == ('CLF30-USD',)
+    assert provider.search_symbols('clf') == ('CLF30-USD',)
+
+
+def _fake_symbol_catalog_backend(monkeypatch, entries):
+    from jesse.modes.import_candles_mode import drivers
+    from jesse.services import symbol_catalog
+
+    class CatalogProvider(BarsOnlyProvider):
+        provider_id = 'Massive Stocks'
+
+        def list_symbol_entries(self):
+            return entries
+
+    class FakeLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeRedis:
+        def __init__(self):
+            self.store = {}
+
+        def get(self, key):
+            return self.store.get(key)
+
+        def setex(self, key, ttl, value):
+            self.store[key] = value.encode()
+
+        def lock(self, *args, **kwargs):
+            return FakeLock()
+
+    fake_redis = FakeRedis()
+    provider_calls = []
+
+    class FakeRegistry:
+        def get(self, exchange):
+            provider_calls.append(exchange)
+            return CatalogProvider()
+
+    monkeypatch.setattr(symbol_catalog, 'sync_redis', fake_redis)
+    monkeypatch.setattr(drivers, 'build_historical_provider_registry', lambda exchanges: FakeRegistry())
+    return fake_redis, provider_calls
+
+
+def test_supported_symbols_endpoint_returns_and_caches_symbol_details(monkeypatch):
+    from jesse.controllers import exchange_controller
+
+    fake_redis, provider_calls = _fake_symbol_catalog_backend(monkeypatch, (
+        SymbolCatalogEntry('SPY-USD', name='SPDR S&P 500 ETF Trust', kind='ETF', venue='NYSE Arca'),
+        SymbolCatalogEntry('BARE-USD'),
+    ))
+
+    expected = {
+        'data': ['SPY-USD', 'BARE-USD'],
+        'details': {'SPY-USD': {'name': 'SPDR S&P 500 ETF Trust', 'kind': 'ETF', 'venue': 'NYSE Arca'}},
+    }
+    first = exchange_controller.get_exchange_supported_symbols('Massive Stocks')
+    second = exchange_controller.get_exchange_supported_symbols('Massive Stocks')
+
+    assert first.status_code == 200
+    assert json.loads(first.body) == expected
+    assert json.loads(second.body) == expected
+    assert provider_calls == ['Massive Stocks']
+    assert list(fake_redis.store) == ['historical-symbols:v2:Massive Stocks']
+
+    fake_redis.store['historical-symbols:v2:Massive Stocks'] = b'["SPY-USD"]'
+    corrupted = exchange_controller.get_exchange_supported_symbols('Massive Stocks')
+    assert corrupted.status_code == 500
+
+
+def test_symbol_search_ranks_ticker_prefixes_before_provider_names(monkeypatch):
+    from jesse.controllers import exchange_controller
+    from jesse.services.symbol_catalog import search_symbol_catalog
+
+    _fake_symbol_catalog_backend(monkeypatch, (
+        SymbolCatalogEntry('GGLL-USD', name='Direxion Daily GOOGL Bull 2X ETF', kind='ETF', venue='NASDAQ'),
+        SymbolCatalogEntry('GOOG-USD', name='Alphabet Inc. Class C', kind='Common Stock', venue='NASDAQ'),
+        SymbolCatalogEntry('GOOGL-USD', name='Alphabet Inc. Class A', kind='Common Stock', venue='NASDAQ'),
+        SymbolCatalogEntry('MSFT-USD', name='Microsoft Corp', kind='Common Stock', venue='NASDAQ'),
+        SymbolCatalogEntry('BARE-USD'),
+    ))
+
+    response = exchange_controller.search_exchange_symbols('Massive Stocks', 'goog', 50)
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload['catalog_size'] == 5
+    assert [match['symbol'] for match in payload['data']] == ['GOOG-USD', 'GOOGL-USD', 'GGLL-USD']
+    assert payload['data'][0] == {
+        'symbol': 'GOOG-USD', 'name': 'Alphabet Inc. Class C', 'kind': 'Common Stock', 'venue': 'NASDAQ',
+    }
+
+    by_name = json.loads(exchange_controller.search_exchange_symbols('Massive Stocks', 'Alphabet', 1).body)
+    assert [match['symbol'] for match in by_name['data']] == ['GOOG-USD']
+    assert json.loads(exchange_controller.search_exchange_symbols('Massive Stocks', '   ', 50).body)['data'] == []
+    assert exchange_controller.search_exchange_symbols('Massive Stocks', 'goog', 0).status_code == 422
+
+    # Crypto-style catalogs without details still match by ticker prefix and return bare entries.
+    plain = {'data': ['BTC-USDT', 'ETH-USDT'], 'details': {}}
+    assert search_symbol_catalog(plain, 'bt') == [{'symbol': 'BTC-USDT'}]
+    assert search_symbol_catalog(plain, 'bitcoin') == []

@@ -14,6 +14,7 @@ The tools include:
 - get_candles: Retrieve candle data for analysis
 - get_existing_candles: List all imported candle data
 - delete_candles: Remove candle data from database
+- search_symbols: Find importable symbols on a candle source by ticker or instrument name
 
 For real-time import progress monitoring, use get_candle_import_progress from events.py
 All tools require authentication via Jesse admin password.
@@ -31,6 +32,7 @@ from jesse.mcp.tools.services.candles import (
     delete_candles_service,
     preview_custom_candle_csv_service,
     clean_and_import_custom_candle_csv_service,
+    search_symbols_service,
 )
 
 
@@ -668,3 +670,23 @@ def register_candles_tools(mcp):
             >>> print(f"BTC datasets remaining: {len(btc_data)}")  # Should be 0
         """
         return delete_candles_service(exchange=exchange, symbol=symbol)
+
+    @mcp.tool()
+    def search_symbols(exchange: str, query: str, limit: int = 20) -> dict:
+        """Find importable symbols on one candle source by ticker prefix or instrument name.
+
+        Use this before import_candles() when the user names an instrument rather than an
+        exact Jesse symbol, or when a Massive import fails with a symbol-not-found error.
+        Ticker prefixes rank first, then symbols whose provider name contains the query.
+
+        - Crypto exchanges (e.g. "Binance Perpetual Futures") match tickers only, such as "BTC".
+        - Massive sources ("Massive Stocks", "Massive Currencies", "Massive Indices",
+          "Massive Futures") also match names such as "microsoft" or "crude", and each match
+          carries `name`, `kind` (Common Stock, ETF, Forex, Crypto, Index, Future), `venue`,
+          and for futures `expiry`. Every source has its own catalogue: Microsoft the company
+          lives on Massive Stocks as MSFT-USD, while Massive Futures lists CME stock futures
+          on Microsoft such as SMSFTU6-USD. Pick the source that matches the user's intent.
+
+        Pass the returned `symbol` value verbatim to import_candles().
+        """
+        return search_symbols_service(exchange=exchange, query=query, limit=limit)

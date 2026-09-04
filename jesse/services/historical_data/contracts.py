@@ -121,6 +121,35 @@ class HistoricalCandle:
 
 
 @dataclass(frozen=True, slots=True)
+class SymbolCatalogEntry:
+    """One selectable Jesse symbol plus the optional provider metadata that helps a person recognize it."""
+
+    symbol: str
+    name: str | None = None
+    kind: str | None = None
+    venue: str | None = None
+    expiry: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise HistoricalCandleValidationError('Symbol catalog entries require a symbol')
+        for field_name in ('name', 'kind', 'venue', 'expiry'):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise HistoricalCandleValidationError(f'Symbol catalog {field_name} must be a nonempty string')
+
+    def details(self) -> dict[str, str]:
+        """Return only the populated descriptive fields so callers never serialize empty metadata."""
+        return {
+            field_name: value
+            for field_name in ('name', 'kind', 'venue', 'expiry')
+            if (value := getattr(self, field_name)) is not None
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderCapabilities:
     credential_validation: bool = False
     ticker_search: bool = False
@@ -371,6 +400,10 @@ class HistoricalCandleProvider(ABC):
     def list_symbols(self) -> tuple[str, ...]:
         """List provider symbols when the provider advertises ticker-search support."""
         raise ProviderCapabilityError(f'Provider {self.provider_id!r} does not support symbol discovery')
+
+    def list_symbol_entries(self) -> tuple[SymbolCatalogEntry, ...]:
+        """List symbols with descriptive metadata; providers without metadata expose bare symbols."""
+        return tuple(SymbolCatalogEntry(symbol) for symbol in self.list_symbols())
 
     def find_earliest_available_timestamp(self, request: HistoricalCandleRequest) -> int | None:
         """Return the first available candle in a range, or its start when discovery is unsupported."""

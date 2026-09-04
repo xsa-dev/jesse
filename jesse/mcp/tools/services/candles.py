@@ -704,3 +704,69 @@ def delete_candles_service(
             "error_type": "network_error",
             "message": f"Network error during candle deletion: {str(e)}"
         }
+
+
+def search_symbols_service(exchange: str, query: str, limit: int = 20) -> dict:
+    """
+    Search one candle source's symbol catalogue by ticker prefix or provider name.
+
+    Uses the same backend ranking as the Dashboard selectors, so a symbol that can be
+    found in the Dashboard can be found here and vice versa.
+
+    Args:
+        exchange: Candle source name exactly as Jesse lists it, e.g. "Massive Stocks".
+        query: Ticker prefix or part of an instrument name, e.g. "MSFT" or "microsoft".
+        limit: Maximum number of matches to return (1-200).
+
+    Returns:
+        Ranked matches with any provider details, or an error message.
+    """
+    api_url = mcp_config.JESSE_API_URL
+    password = mcp_config.JESSE_PASSWORD
+
+    try:
+        auth_token_hashed = hash_password(password)
+        # Large provider catalogues can take several seconds to load on their first request.
+        response = requests.post(
+            f'{api_url}/exchange/search-symbols',
+            headers={'Authorization': auth_token_hashed},
+            json={'exchange': exchange, 'query': query, 'limit': limit},
+            timeout=120,
+        )
+
+        if response.status_code == 200:
+            payload = response.json()
+            matches = payload.get('data', [])
+            return {
+                "status": "success",
+                "action": "symbols_searched",
+                "exchange": exchange,
+                "query": query,
+                "match_count": len(matches),
+                "catalog_size": payload.get('catalog_size'),
+                "matches": matches,
+                "message": (
+                    f"Found {len(matches)} symbol(s) on {exchange} for {query!r}"
+                    if matches else f"No symbol on {exchange} matches {query!r}"
+                ),
+            }
+        try:
+            detail = response.json().get('error') or response.text
+        except ValueError:
+            detail = response.text
+        return {
+            "status": "error",
+            "action": "symbol_search_failed",
+            "error_type": "api_error",
+            "http_status": response.status_code,
+            "message": f"Failed to search symbols on {exchange}: {detail}",
+        }
+    except ValueError as e:
+        return {"status": "error", "action": "config_error", "message": str(e)}
+    except Exception as e:
+        return {
+            "status": "error",
+            "action": "symbol_search_failed",
+            "error_type": "network_error",
+            "message": f"Network error during symbol search: {str(e)}",
+        }
