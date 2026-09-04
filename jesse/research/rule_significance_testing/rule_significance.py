@@ -1,11 +1,11 @@
 """
 Public entry point: rule_significance_test()
 
-Tests whether a trading rule has genuine predictive power or whether its
-observed returns could plausibly arise from chance.
+Tests whether a trading rule has next-bar predictive power or whether its
+observed next-bar returns could plausibly arise from chance.
 
-Null hypothesis H0: the rule has no predictive power and its returns are
-                    due to random coincidence.
+Null hypothesis H0: the rule's expected next-bar detrended return is not
+                    positive.
 
 The function runs in two phases:
 
@@ -17,8 +17,9 @@ The function runs in two phases:
       entry signal (+1 / -1 / 0).
 
   Phase 2 – Bootstrap simulation
-      Resample the rule's zero-centred returns with replacement N times
-      and build a null sampling distribution.
+      Resample random-length contiguous blocks of the rule's zero-centred
+      returns and build a null sampling distribution while preserving local
+      time-series dependence.
       p-value = fraction of simulated means ≥ the observed mean.
 """
 
@@ -50,9 +51,10 @@ def rule_significance_test(
     progress_bar: bool = False,
     cpu_cores: Optional[int] = None,
     progress_callback=None,
+    bootstrap_mean_block_length: int = 10,
 ) -> dict:
     """
-    Test whether a trading rule has genuine predictive power using
+    Test whether a trading rule has next-bar predictive power using
     bootstrap resampling.
 
     Parameters
@@ -84,8 +86,9 @@ def rule_significance_test(
     n_simulations : int
         Number of bootstrap resamples (default 2000; 2000+ recommended).
     random_seed : int, optional
-        Base random seed for reproducibility.  Each batch
-        receives seed + batch_index.
+        Random seed for reproducibility.
+    bootstrap_mean_block_length : int
+        Mean length of the stationary-bootstrap blocks (default 10 bars).
     progress_bar : bool
         Show a tqdm progress bar over the simulation batches.
     cpu_cores : int, optional
@@ -100,6 +103,7 @@ def rule_significance_test(
         p_value           float       fraction of sims ≥ observed_mean
         n_simulations     int         simulations actually completed
         n_observations    int         number of bars used (after NaN removal)
+        bootstrap_mean_block_length int  mean stationary-bootstrap block length
     """
     # ------------------------------------------------------------------
     # Input validation
@@ -109,6 +113,8 @@ def rule_significance_test(
             f'rule_significance_test() requires exactly one trading route; '
             f'{len(routes)} were provided.'
         )
+    if bootstrap_mean_block_length < 1:
+        raise ValueError('bootstrap_mean_block_length must be at least 1')
 
     resolved_seed = random_seed if random_seed is not None else 42
     resolved_cores = _resolve_cpu_cores(cpu_cores)
@@ -205,6 +211,7 @@ def rule_significance_test(
             n_simulations=n_simulations,
             cpu_cores=resolved_cores,
             random_seed=resolved_seed,
+            mean_block_length=bootstrap_mean_block_length,
             pbar=pbar,
             progress_callback=phase2_callback,
         )
@@ -230,4 +237,5 @@ def rule_significance_test(
         'p_value': p_value,
         'n_simulations': len(sim_means),
         'n_observations': n_obs,
+        'bootstrap_mean_block_length': bootstrap_mean_block_length,
     }

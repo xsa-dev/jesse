@@ -355,15 +355,14 @@ Workflow:
 4. Poll `get_significance_test_session(session_id)` every few seconds until
    `status` is `"finished"`, `"stopped"`, or `"terminated"`.
 5. Inspect `results.p_value`:
-   - `p_value < 0.05`  → edge confirmed. Proceed to build the full strategy.
+   - `p_value < 0.05`  → next-bar entry edge supported. Proceed to broader validation.
    - `0.05 <= p_value <= 0.10` → borderline. Surface the number to the user
      explicitly, flag it as inconclusive, and ask whether to proceed, refine
      the signal, change timeframe or widen the date window. Do NOT
      pretend it's a confirmed edge.
-   - `p_value > 0.10` → **HARD STOP**. The signal is indistinguishable from
-     random. Report the result and ask the user whether to refine or abandon
-     the idea. Do NOT silently proceed to a full backtest — that wastes the
-     user's time on a signal that didn't beat random.
+   - `p_value > 0.10` → no reliable next-bar entry edge. Report that narrow
+     conclusion without calling the full strategy worthless: exits, stops,
+     targets, sizing, and multi-bar holding behavior are outside this test.
 6. Always report `observed_mean`, `annualized_return`, `p_value`,
    `n_simulations`, and `n_observations` to the user.
 

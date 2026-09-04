@@ -1,10 +1,9 @@
 # Rule Significance Testing (RST) via MCP
 
-Rule Significance Testing tells you whether a strategy's entry signal has a
-genuine statistical edge or is indistinguishable from random entries on the
-same data. It runs the real strategy once, then runs `n_simulations` random
-variants of it (preserving trade count and trade duration distribution) and
-returns a p-value.
+Rule Significance Testing checks whether a strategy's entry conditions predict
+the direction of the next bar after market drift is removed. It records
+`should_long()` / `should_short()` without placing orders, then applies a
+stationary bootstrap to the zero-centred next-bar rule-return series.
 
 **Use this BEFORE writing a full strategy** when you only have a hypothesis,
 and any time the user asks you to "validate an entry signal".
@@ -12,7 +11,7 @@ and any time the user asks you to "validate an entry signal".
 ## When to use
 
 - A user proposes a new strategy idea ("buy when RSI < 30 and MACD crosses up").
-  → Wrap that signal in a minimal strategy, RST it, only proceed if p < 0.05.
+  → Wrap that signal in a minimal strategy and use RST as one entry-timing diagnostic.
 - A user asks "is this entry signal any good?" / "validate this signal".
   → RST it on a meaningful date window and report the p-value.
 - You finished a full backtest with mediocre results and want to know whether
@@ -22,9 +21,9 @@ and any time the user asks you to "validate an entry signal".
 
 | `p_value` | Meaning |
 |-----------|---------|
-| `< 0.05`  | Statistically significant edge — entries are not random. Proceed. |
+| `< 0.05`  | Statistically significant evidence of next-bar entry edge. |
 | `0.05 – 0.10` | Borderline. Surface the number to the user, flag as inconclusive, consider widening the window or raising `n_simulations`. |
-| `> 0.10`  | **Hard stop.** Indistinguishable from random. Do not silently proceed to a full backtest — report and ask the user whether to refine or abandon the idea. |
+| `> 0.10`  | No reliable next-bar entry edge. This is not a verdict on the full strategy or on multi-bar holding behavior. |
 
 Always report `observed_mean`, `annualized_return`, `p_value`, `n_simulations`,
 and `n_observations` to the user.
